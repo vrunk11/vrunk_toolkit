@@ -32,6 +32,7 @@ void usage(void)
 		"Usage:\n"
 		"\t[-l luma file (use '-' to read from stdin)\n"
 		"\t[-c chroma file (use '-' to read from stdin)\n"
+		"\t[-o output file (use '-' to read from stdin)\n"
 		"\t[-b bit depth (8 or 16) default = 16\n"
 		"\t[-s video standard (pal / ntsc) default = ntsc\n"
 	);
@@ -81,14 +82,14 @@ void process_files(FILE *F1,FILE *F2,unsigned short *out_buf,unsigned int buf_si
 		{
 			value16 = tmp_r_buf[i];
 			value16_2 = tmp_r2_buf[i];
-			/*if((tmp_r_buf16[i] + tmp_r2_buf16[i] + 32768) > 65535)
+			if((*value16_signed + *value16_2_signed + 32768) > 65535)
 			{
 				tmp_w_buf[i] = 65535;
 			}
-			else if((tmp_r_buf16[i] + tmp_r2_buf16[i] + 32768) < 1024)
+			else if((*value16_signed + *value16_2_signed + 32768) < 1)
 			{
-				tmp_w_buf[i] = 1024;
-			}*/
+				tmp_w_buf[i] = 1;
+			}
 			tmp_w_buf[i] = *value16_signed + *value16_2_signed + 32768;//add luma + chroma 
 			i++;
 		}
@@ -99,14 +100,14 @@ void process_files(FILE *F1,FILE *F2,unsigned short *out_buf,unsigned int buf_si
 		{
 			value8 = tmp_r_buf8[i];
 			value8_2 = tmp_r2_buf8[i];
-			/*if((tmp_r_buf8[i] + tmp_r2_buf8[i] + 32768) > 255)
+			if((*value8_signed + *value8_2_signed + 128) > 255)
 			{
 				tmp_w_buf8[i] = 255;
 			}
-			else if((tmp_r_buf8[i] + tmp_r2_buf8[i] + 32768) < 3)
+			else if((*value8_signed + *value8_2_signed + 128) < 1)
 			{
-				tmp_w_buf8[i] = 3;
-			}*/
+				tmp_w_buf8[i] = 1;
+			}
 			tmp_w_buf8[i] = *value8_signed + *value8_2_signed + 128;//add luma + chroma
 			i++;
 		}
@@ -132,10 +133,12 @@ int main(int argc, char **argv)
 	//file adress
 	char *input_name_1 = NULL;
 	char *input_name_2 = NULL;
+	char *output_name_f = NULL;
 	
 	//input file
 	FILE *input_1;
 	FILE *input_2;
+	FILE *output_f;
 	
 	char standard = 'N';//default ntsc
 	int bitdepth = 16;//default 16bit
@@ -143,7 +146,7 @@ int main(int argc, char **argv)
 	unsigned short *buf = NULL;
 	unsigned int buf_length = 0;
 
-	while ((opt = getopt(argc, argv, "s:b:l:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "s:b:l:c:o:")) != -1) {
 		switch (opt) {
 		case 's':
 			if((strcmp(optarg, "ntsc" ) == 0) || (strcmp(optarg, "NTSC" ) == 0) || (strcmp(optarg, "Ntsc" ) == 0) || (strcmp(optarg, "N" ) == 0) || (strcmp(optarg, "n" ) == 0))
@@ -167,6 +170,9 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			input_name_2 = optarg;
+			break;
+		case 'o':
+			output_name_f = optarg;
 			break;
 		default:
 			usage();
@@ -209,6 +215,20 @@ int main(int argc, char **argv)
 		}
 	}
 	
+	//opening output file
+	if (strcmp(output_name_f, "-") == 0)// Read samples from stdin
+	{
+		output_f = stdout;
+	}
+	else
+	{
+		output_f = fopen(output_name_f, "wb");
+		if (!output_f) {
+			fprintf(stderr, "(2) : Failed to open %s\n", output_f);
+			return -ENOENT;
+		}
+	}
+	
 	if(standard == 'N' || standard == 'P')
 	{
 		if(standard == 'N')
@@ -238,12 +258,9 @@ int main(int argc, char **argv)
 	{
 		process_files(input_1,input_2,buf,buf_length,bitdepth);
 	
-		//write to stdout (pipe)
-		if(isatty(STDOUT_FILENO) == 0)
-		{
-			fwrite(buf, buf_length,1,stdout);
-			fflush(stdout);
-		}
+		//write output
+		fwrite(buf, buf_length,1,output_f);
+		fflush(output_f);
 	}
 
 ////ending of the program
@@ -260,6 +277,12 @@ int main(int argc, char **argv)
 	if (input_2 && (input_2 != stdin))
 	{
 		fclose(input_2);
+	}
+	
+	//Close out file
+	if (output_f && (output_f != stdout))
+	{
+		fclose(output_f);
 	}
 
 	return 0;
