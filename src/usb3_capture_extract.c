@@ -5,6 +5,7 @@
 #include <math.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <stdint.h>
 
 #ifndef _WIN32
 	#include <unistd.h>
@@ -61,10 +62,18 @@ int main(int argc, char **argv)
 	FILE *output_2;
 	FILE *output_aux;
 	
-	//bufer used for reading data
-	unsigned short *buf_1   = malloc(sizeof(short));
-	unsigned short *buf_2   = malloc(sizeof(short));
-	unsigned char  *buf_aux = malloc(sizeof(char));
+	//bufer
+	uint32_t *buf_tmp = malloc(sizeof(uint32_t)*65000);
+	uint16_t *buf_1   = malloc(sizeof(uint16_t)*65000);
+	uint16_t *buf_2   = malloc(sizeof(uint16_t)*65000);
+	uint8_t  *buf_aux = malloc(sizeof(uint8_t) *65000);
+	
+	//number of byte read
+	int nb_block;
+	
+	const uint32_t mask_1   = 0xFFF;
+	const uint32_t mask_2   = 0xFFF00000;
+	const uint32_t mask_aux = 0xFF000;
 	
 	while ((opt = getopt(argc, argv, "i:a:b:x:")) != -1) {
 		switch (opt) {
@@ -163,10 +172,15 @@ int main(int argc, char **argv)
 	{
 		while(!feof(input_1))
 		{
-			fread(buf_1  ,12,1,input_1);
-			fread(buf_aux, 8,1,input_1);
-			fread(buf_2  ,12,1,input_1);
-		
+			nb_block = fread(buf_tmp  ,65000,4,input_1);
+			
+			for(int i = 0; i < nb_block; i++)
+			{
+				buf_1[i]   = (buf_tmp[i] & mask_1);
+				buf_2[i]   = (buf_tmp[i] & mask_2) >> 20;
+				buf_aux[i] = (buf_tmp[i] & mask_aux) >> 12;
+			}
+			
 			//write output
 			if(output_name_1   != NULL){fwrite(buf_1, 16,1,output_1);}
 			if(output_name_2   != NULL){fwrite(buf_2, 16,1,output_2);}
