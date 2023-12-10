@@ -71,9 +71,16 @@ int main(int argc, char **argv)
 	//number of byte read
 	int nb_block;
 	
-	const uint32_t mask_1   = 0xFFF;
-	const uint32_t mask_2   = 0xFFF00000;
-	const uint32_t mask_aux = 0xFF000;
+	//bits masking
+	const uint32_t mask_1      = 0xFFF;
+	const uint32_t mask_clip_1 = 0x1000;
+	const uint32_t mask_2      = 0xFFF00000;
+	const uint32_t mask_clip_2 = 0x80000;
+	const uint32_t mask_aux    = 0x7E000;
+	
+	//clipping state
+	int clip_A = 0;
+	int clip_B = 0;
 	
 	while ((opt = getopt(argc, argv, "i:a:b:x:")) != -1) {
 		switch (opt) {
@@ -178,7 +185,29 @@ int main(int argc, char **argv)
 			{
 				buf_1[i]   = (buf_tmp[i] & mask_1);
 				buf_2[i]   = (buf_tmp[i] & mask_2) >> 20;
-				buf_aux[i] = (buf_tmp[i] & mask_aux) >> 12;
+				buf_aux[i] = (buf_tmp[i] & mask_aux) >> 13;
+				
+				if(((buf_tmp[i] & mask_clip_1) >> 19) == 1)
+				{
+					clip_A++;
+				}
+				
+				if(((buf_tmp[i] & mask_clip_2) >> 12) == 1)
+				{
+					clip_B++;
+				}
+			}
+			
+			if(clip_A > 0)
+			{
+				fprintf(stderr,"ADC A : %d sample clipped",clip_A);
+				clip_A = 0; 
+			}
+			
+			if(clip_B > 0)
+			{
+				fprintf(stderr,"ADC B : %d sample clipped",clip_B);
+				clip_B = 0; 
 			}
 			
 			//write output
