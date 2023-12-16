@@ -75,8 +75,8 @@ int main(int argc, char **argv)
 	const uint32_t mask_1      = 0xFFF;
 	const uint32_t mask_clip_1 = 0x1000;
 	const uint32_t mask_2      = 0xFFF00000;
-	const uint32_t mask_clip_2 = 0x80000;
-	const uint32_t mask_aux    = 0x7E000;
+	const uint32_t mask_clip_2 = 0x2000;
+	const uint32_t mask_aux    = 0xFC000;
 	
 	//clipping state
 	int clip_A = 0;
