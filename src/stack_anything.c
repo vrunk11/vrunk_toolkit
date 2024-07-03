@@ -142,7 +142,7 @@ int process_files(FILE *F1[32], int nb_files, unsigned short *out_buf, unsigned 
 					}
 					else
 					{
-						if((value16[i] < (median + (treshold * 256))) && (value16[i] > (treshold * 256)))//255 * 4 = 1020 (16bit)
+						if((value16[i] < (median + (treshold * 256))) && (value16[i] > (median - treshold * 256)))//255 * 4 = 1020 (16bit)
 						{
 							nb_select++;
 							calc += value16[i];
