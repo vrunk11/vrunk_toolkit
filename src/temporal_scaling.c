@@ -54,33 +54,30 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
 {
     for(int r = 0; r < ratio; r++)
     {
+        int err = (r * in_w) / ratio;  // phase en unités source, pas dest
+        int src = 0;
         int dst = r * out_w;
         for(int px = 0; px < out_w; px++)
         {
-            int num       = px * in_w;
-            int src       = num / out_w;
-            int remainder = num % out_w;
-            // px montre src+1 pour les subframes r où r/ratio < frac
-            // ce qui donne exactement frac*ratio subframes sur ratio → moyenne correcte
-            int use_next  = (remainder * ratio) > (out_w * (ratio - 1 - r));
-            map->w[dst++] = src + (use_next && src + 1 < in_w ? 1 : 0);
+            map->w[dst++] = src;
+            err += in_w;
+            if(err >= out_w) { err -= out_w; src++; }
         }
     }
 
     for(int r = 0; r < ratio; r++)
     {
+        int err = (r * in_h) / ratio;
+        int src = 0;
         int dst = r * out_h;
         for(int px = 0; px < out_h; px++)
         {
-            int num       = px * in_h;
-            int src       = num / out_h;
-            int remainder = num % out_h;
-            int use_next  = (remainder * ratio) > (out_h * (ratio - 1 - r));
-            map->h[dst++] = src + (use_next && src + 1 < in_h ? 1 : 0);
+            map->h[dst++] = src;
+            err += in_h;
+            if(err >= out_h) { err -= out_h; src++; }
         }
     }
 }
-
 void process_files(unsigned char *in_buf, unsigned int in_buf_size, unsigned char *out_buf, unsigned int out_buf_size, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
 {
     unsigned char *tmp_buf = malloc(out_w * in_h * 3);
