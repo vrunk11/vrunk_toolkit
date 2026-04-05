@@ -25,15 +25,15 @@
 #define FSEEK fseeko
 #endif
 
-#define NB_THREADS 4
+#define NB_THREADS 6
 
 typedef struct BresenhamMap BresenhamMap;
 struct BresenhamMap
 {
-	int *w;
-	int *h;
-	unsigned int w_length;
-	unsigned int h_length;
+    int (*w)[2];
+    int (*h)[2];
+    int w_length;
+    int h_length;
 };
 
 typedef struct ThreadArgs ThreadArgs;
@@ -71,7 +71,9 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         int dst = r * out_w;
         for(int px = 0; px < out_w; px++)
         {
-            map->w[dst++] = src;
+            map->w[dst][0] = src;
+			map->w[dst][1] = (err > out_w / 2) ? 1 : 0;
+			dst++;
             err += in_w;
             if(err >= out_w) { err -= out_w; src++; }
         }
@@ -84,7 +86,9 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         int dst = r * out_h;
         for(int px = 0; px < out_h; px++)
         {
-            map->h[dst++] = src;
+            map->h[dst][0] = src;
+			map->h[dst][1] = (err > out_h / 2) ? 1 : 0;
+			dst++;
             err += in_h;
             if(err >= out_h) { err -= out_h; src++; }
         }
@@ -102,10 +106,21 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
         {
             for(int px=0; px<(out_w*3); px+=3)
             {
-                int src_px = map->w[r*out_w + px/3] * 3;
-                tmp_buf[(h*out_w*3)+px]   = in_buf[(h*in_w*3)+src_px];
-                tmp_buf[(h*out_w*3)+px+1] = in_buf[(h*in_w*3)+src_px+1];
-                tmp_buf[(h*out_w*3)+px+2] = in_buf[(h*in_w*3)+src_px+2];
+                int src_px = map->w[r*out_w + px/3][0] * 3;
+				int is_bilinear_w = map->w[r*out_w + px/3][1];
+
+				if(mode == 1 && is_bilinear_w && src_px + 3 < in_w*3)
+				{
+					tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px]   + in_buf[(h*in_w*3)+src_px+3])   / 2;
+					tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px+1] + in_buf[(h*in_w*3)+src_px+4]) / 2;
+					tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px+2] + in_buf[(h*in_w*3)+src_px+5]) / 2;
+				}
+				else
+				{
+					tmp_buf[(h*out_w*3)+px]   = in_buf[(h*in_w*3)+src_px];
+					tmp_buf[(h*out_w*3)+px+1] = in_buf[(h*in_w*3)+src_px+1];
+					tmp_buf[(h*out_w*3)+px+2] = in_buf[(h*in_w*3)+src_px+2];
+				}
             }
         }
 
@@ -114,10 +129,21 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
         {
             for(int px=0; px<(out_h*3); px+=3)
             {
-                int src_line = map->h[r*out_h + px/3];
-                out_buf[offset+(px/3*out_w+w)*3]   = tmp_buf[(src_line*out_w+w)*3];
-                out_buf[(offset+(px/3*out_w+w)*3)+1] = tmp_buf[((src_line*out_w+w)*3)+1];
-                out_buf[(offset+(px/3*out_w+w)*3)+2] = tmp_buf[((src_line*out_w+w)*3)+2];
+                int src_line = map->h[r*out_h + px/3][0];
+				int is_bilinear_h = map->h[r*out_h + px/3][1];
+
+				if(mode == 1 && is_bilinear_h && src_line + 1 < in_h)
+				{
+					out_buf[offset+(px/3*out_w+w)*3]   = (tmp_buf[(src_line*out_w+w)*3]   + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
+					out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line)*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
+					out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line)*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
+				}
+				else
+				{
+					out_buf[offset+(px/3*out_w+w)*3]   = tmp_buf[(src_line*out_w+w)*3];
+					out_buf[(offset+(px/3*out_w+w)*3)+1] = tmp_buf[((src_line*out_w+w)*3)+1];
+					out_buf[(offset+(px/3*out_w+w)*3)+2] = tmp_buf[((src_line*out_w+w)*3)+2];
+				}
             }
         }
         offset += out_w*out_h*3;
@@ -242,8 +268,8 @@ int main(int argc, char **argv)
 		map.w_length = out_w * frames_ratio;
 		map.h_length = out_h * frames_ratio;
 		
-		map.w = malloc(map.w_length * sizeof(int));
-		map.h = malloc(map.h_length * sizeof(int));
+		map.w = (int (*)[2])malloc(map.w_length * 2 * sizeof(int));
+		map.h = (int (*)[2])malloc(map.h_length * 2 * sizeof(int));
 		
 		int alloc_err = 0;
 		for(int t=0; t<NB_THREADS; t++)
