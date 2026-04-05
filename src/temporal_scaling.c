@@ -48,18 +48,63 @@ struct ThreadArgs
 
 void usage(void)
 {
-	fprintf(stderr,
-		"Vrunk11 toolkit, a simple program for process video\n\n"
-		"Usage:\n"
-		"\t[-i filename (use '-' to read from stdin)\n"
-	);
-	exit(1);
+    fprintf(stderr,
+        "temporal_scaling - temporal pixel art upscaler\n\n"
+        "Usage:\n"
+        "\t-i filename        input raw video file (use '-' for stdin)\n\n"
+        "Options:\n"
+        "\t--in-width  INT    input width  (default: 720)\n"
+        "\t--in-height INT    input height (default: 480)\n"
+        "\t--out-width INT    output width  (default: 1920)\n"
+        "\t--out-height INT   output height (default: 1080)\n"
+        "\t--fps-ratio INT    output/input fps multiplier (default: 2)\n"
+        "\t--mode INT         scaling mode (default: 0)\n"
+        "\t                     0 = nearest neighbor\n"
+        "\t                     1 = bilinear on duplicated pixels\n"
+        "\t                     2 = bilinear with temporal alternation\n\n"
+    );
+    exit(1);
 }
 
 const char *get_filename_ext(const char *filename) {
     const char *dot = strrchr(filename, '.');
     if(!dot || dot == filename) return "";
     return dot + 1;
+}
+
+void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int in_w, int in_h, int ratio)
+{
+    // ajustement axe horizontal
+    for(int r=1; r<ratio; r++)
+    {
+        // etape 1 : compte le chevauchement global
+        int overlap = 0;
+        for(int px=0; px<out_w; px++)
+            if(map->w[r*out_w+px][1] == 1 && map->w[(r-1)*out_w+px][1] == 1)
+                overlap++;
+        
+        // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
+        if(overlap > out_w/2)
+            for(int px=0; px<out_w; px++)
+                if(map->w[r*out_w+px][1] == 1)
+                    map->w[r*out_w+px][1] = -1;
+    }
+
+    // ajustement axe vertical
+    for(int r=1; r<ratio; r++)
+    {
+        // etape 1 : compte le chevauchement global
+        int overlap = 0;
+        for(int px=0; px<out_h; px++)
+            if(map->h[r*out_h+px][1] == 1 && map->h[(r-1)*out_h+px][1] == 1)
+                overlap++;
+        
+        // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
+        if(overlap > out_h/2)
+            for(int px=0; px<out_h; px++)
+                if(map->h[r*out_h+px][1] == 1)
+                    map->h[r*out_h+px][1] = -1;
+    }
 }
 
 void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio)
@@ -98,7 +143,6 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
 void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char *tmp_buf, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
 {
     unsigned int offset = 0;
-
     for(int r=0; r<ratio; r++)
     {
         //scale the width line by line
@@ -107,20 +151,28 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
             for(int px=0; px<(out_w*3); px+=3)
             {
                 int src_px = map->w[r*out_w + px/3][0] * 3;
-				int is_bilinear_w = map->w[r*out_w + px/3][1];
+                int is_bilinear_w = map->w[r*out_w + px/3][1];
 
-				if(mode == 1 && is_bilinear_w && src_px + 3 < in_w*3)
-				{
-					tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px]   + in_buf[(h*in_w*3)+src_px+3])   / 2;
-					tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px+1] + in_buf[(h*in_w*3)+src_px+4]) / 2;
-					tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px+2] + in_buf[(h*in_w*3)+src_px+5]) / 2;
-				}
-				else
-				{
-					tmp_buf[(h*out_w*3)+px]   = in_buf[(h*in_w*3)+src_px];
-					tmp_buf[(h*out_w*3)+px+1] = in_buf[(h*in_w*3)+src_px+1];
-					tmp_buf[(h*out_w*3)+px+2] = in_buf[(h*in_w*3)+src_px+2];
-				}
+                if(mode >= 1 && is_bilinear_w == 1 && src_px + 3 < in_w*3)
+                {
+                    // moyenne avec voisin droite
+                    tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px]   + in_buf[(h*in_w*3)+src_px+3])   / 2;
+                    tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px+1] + in_buf[(h*in_w*3)+src_px+4]) / 2;
+                    tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px+2] + in_buf[(h*in_w*3)+src_px+5]) / 2;
+                }
+                else if(mode >= 1 && is_bilinear_w == -1 && src_px - 3 >= 0)
+                {
+                    // moyenne avec voisin gauche
+                    tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px-3] + in_buf[(h*in_w*3)+src_px])   / 2;
+                    tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px-2] + in_buf[(h*in_w*3)+src_px+1]) / 2;
+                    tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px-1] + in_buf[(h*in_w*3)+src_px+2]) / 2;
+                }
+                else
+                {
+                    tmp_buf[(h*out_w*3)+px]   = in_buf[(h*in_w*3)+src_px];
+                    tmp_buf[(h*out_w*3)+px+1] = in_buf[(h*in_w*3)+src_px+1];
+                    tmp_buf[(h*out_w*3)+px+2] = in_buf[(h*in_w*3)+src_px+2];
+                }
             }
         }
 
@@ -130,20 +182,28 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
             for(int px=0; px<(out_h*3); px+=3)
             {
                 int src_line = map->h[r*out_h + px/3][0];
-				int is_bilinear_h = map->h[r*out_h + px/3][1];
+                int is_bilinear_h = map->h[r*out_h + px/3][1];
 
-				if(mode == 1 && is_bilinear_h && src_line + 1 < in_h)
-				{
-					out_buf[offset+(px/3*out_w+w)*3]   = (tmp_buf[(src_line*out_w+w)*3]   + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
-					out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line)*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
-					out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line)*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
-				}
-				else
-				{
-					out_buf[offset+(px/3*out_w+w)*3]   = tmp_buf[(src_line*out_w+w)*3];
-					out_buf[(offset+(px/3*out_w+w)*3)+1] = tmp_buf[((src_line*out_w+w)*3)+1];
-					out_buf[(offset+(px/3*out_w+w)*3)+2] = tmp_buf[((src_line*out_w+w)*3)+2];
-				}
+                if(mode >= 1 && is_bilinear_h == 1 && src_line + 1 < in_h)
+                {
+                    // moyenne avec ligne du dessous
+                    out_buf[offset+(px/3*out_w+w)*3]     = (tmp_buf[(src_line*out_w+w)*3]     + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
+                    out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line)*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
+                    out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line)*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
+                }
+                else if(mode >= 1 && is_bilinear_h == -1 && src_line - 1 >= 0)
+                {
+                    // moyenne avec ligne du dessus
+                    out_buf[offset+(px/3*out_w+w)*3]     = (tmp_buf[((src_line-1)*out_w+w)*3]     + tmp_buf[(src_line*out_w+w)*3])   / 2;
+                    out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line-1)*out_w+w)*3+1] + tmp_buf[((src_line)*out_w+w)*3+1]) / 2;
+                    out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line-1)*out_w+w)*3+2] + tmp_buf[((src_line)*out_w+w)*3+2]) / 2;
+                }
+                else
+                {
+                    out_buf[offset+(px/3*out_w+w)*3]     = tmp_buf[(src_line*out_w+w)*3];
+                    out_buf[(offset+(px/3*out_w+w)*3)+1] = tmp_buf[((src_line)*out_w+w)*3+1];
+                    out_buf[(offset+(px/3*out_w+w)*3)+2] = tmp_buf[((src_line)*out_w+w)*3+2];
+                }
             }
         }
         offset += out_w*out_h*3;
@@ -301,7 +361,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(mode < 0 || mode > 1)
+	if(mode < 0 || mode > 2)
 	{
 		fprintf(stderr, "Error : mode '%d' is not supported\n", mode);
 		return -1;
@@ -309,6 +369,11 @@ int main(int argc, char **argv)
 	
 	//compute the maping used for scaling the input image into an output one
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
+	
+	if(mode == 2)
+	{
+		adjust_bilinear_phases(&map, out_w, out_h, in_w, in_h, frames_ratio);
+	}
 	
 	pthread_t thread_1;
 	pthread_t thread_2;
