@@ -25,6 +25,8 @@
 #define FSEEK fseeko
 #endif
 
+#define NB_THREADS 4
+
 typedef struct BresenhamMap BresenhamMap;
 struct BresenhamMap
 {
@@ -32,6 +34,16 @@ struct BresenhamMap
 	int *h;
 	unsigned int w_length;
 	unsigned int h_length;
+};
+
+typedef struct ThreadArgs ThreadArgs;
+struct ThreadArgs
+{
+	unsigned char *in_buf;
+	unsigned char *out_buf;
+	unsigned char *tmp_buf;
+	BresenhamMap *map;
+	int in_w, in_h, out_w, out_h, ratio, mode;
 };
 
 void usage(void)
@@ -78,9 +90,9 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         }
     }
 }
-void process_files(unsigned char *in_buf, unsigned int in_buf_size, unsigned char *out_buf, unsigned int out_buf_size, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
+
+void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char *tmp_buf, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
 {
-    unsigned char *tmp_buf = malloc(out_w * in_h * 3);
     unsigned int offset = 0;
 
     for(int r=0; r<ratio; r++)
@@ -110,7 +122,13 @@ void process_files(unsigned char *in_buf, unsigned int in_buf_size, unsigned cha
         }
         offset += out_w*out_h*3;
     }
-    free(tmp_buf);
+}
+
+void *thread_func(void *arg)
+{
+	ThreadArgs *a = (ThreadArgs *)arg;
+	process_files(a->in_buf, a->out_buf, a->tmp_buf, a->map, a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
+	return NULL;
 }
 
 int main(int argc, char **argv)
@@ -137,8 +155,15 @@ int main(int argc, char **argv)
 	int mode = 0;
 	
 	//buffer
-	unsigned char *in_buf = NULL;
-	unsigned char *out_buf = NULL;
+	unsigned char *in_buf[NB_THREADS];
+	unsigned char *out_buf[NB_THREADS];
+	unsigned char *tmp_buf[NB_THREADS];
+	for(int t=0; t<NB_THREADS; t++)
+	{
+		in_buf[t] = NULL;
+		out_buf[t] = NULL;
+		tmp_buf[t] = NULL;
+	}
 	
 	//buffer length
 	unsigned int in_buf_length = 0;
@@ -217,16 +242,29 @@ int main(int argc, char **argv)
 		map.w_length = out_w * frames_ratio;
 		map.h_length = out_h * frames_ratio;
 		
-		in_buf = malloc(in_buf_length);
-		out_buf = malloc(out_buf_length);
 		map.w = malloc(map.w_length * sizeof(int));
 		map.h = malloc(map.h_length * sizeof(int));
-		if(in_buf == NULL || out_buf == NULL || map.w == NULL || map.h == NULL)//check allocation error
+		
+		int alloc_err = 0;
+		for(int t=0; t<NB_THREADS; t++)
 		{
-			free(in_buf);
-			free(out_buf);
+			in_buf[t] = malloc(in_buf_length);
+			out_buf[t] = malloc(out_buf_length);
+			tmp_buf[t] = malloc(out_w * in_h * 3);
+			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL)
+				alloc_err = 1;
+		}
+		
+		if(map.w == NULL || map.h == NULL || alloc_err)//check allocation error
+		{
 			free(map.w);
 			free(map.h);
+			for(int t=0; t<NB_THREADS; t++)
+			{
+				free(in_buf[t]);
+				free(out_buf[t]);
+				free(tmp_buf[t]);
+			}
 			fprintf(stderr, "malloc error (buf)\n");
 			return -1;
 		}
@@ -246,26 +284,69 @@ int main(int argc, char **argv)
 	//compute the maping used for scaling the input image into an output one
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	
+	pthread_t thread_1;
+	pthread_t thread_2;
+	pthread_t thread_3;
+	pthread_t thread_4;
+	
+	ThreadArgs args[NB_THREADS];
+	for(int t=0; t<NB_THREADS; t++)
+	{
+		args[t].map = &map;
+		args[t].in_w = in_w;
+		args[t].in_h = in_h;
+		args[t].out_w = out_w;
+		args[t].out_h = out_h;
+		args[t].ratio = frames_ratio;
+		args[t].mode = mode;
+	}
+	
 	while(!feof(input))
 	{
-		fread(in_buf,in_buf_length,1,input);
+		//read NB_THREADS frames
+		int frames_read = 0;
+		for(int t=0; t<NB_THREADS; t++)
+		{
+			if(fread(in_buf[t], in_buf_length, 1, input) == 1)
+			{
+				args[t].in_buf = in_buf[t];
+				args[t].out_buf = out_buf[t];
+				args[t].tmp_buf = tmp_buf[t];
+				frames_read++;
+			}
+			else break;
+		}
 		
-		process_files(in_buf,in_buf_length,out_buf,out_buf_length,&map, in_w, in_h, out_w, out_h,frames_ratio,mode);
+		//launch threads
+		pthread_t threads[NB_THREADS];
+		for(int t=0; t<frames_read; t++)
+			pthread_create(&threads[t], NULL, thread_func, &args[t]);
+		
+		//wait for all threads
+		for(int t=0; t<frames_read; t++)
+			pthread_join(threads[t], NULL);
 		
 		//write to stdout (pipe)
 		if(isatty(STDOUT_FILENO) == 0)
 		{
-			fwrite(out_buf, out_buf_length,1,stdout);
+			for(int t=0; t<frames_read; t++)
+			{
+				fwrite(out_buf[t], out_buf_length, 1, stdout);
+			}
 			fflush(stdout);
 		}
 	}
 
 ////ending of the program
 	
-	free(in_buf);
-	free(out_buf);
 	free(map.w);
 	free(map.h);
+	for(int t=0; t<NB_THREADS; t++)
+	{
+		free(in_buf[t]);
+		free(out_buf[t]);
+		free(tmp_buf[t]);
+	}
 	
 	//Close file
 	if (input && (input != stdin))
