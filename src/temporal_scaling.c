@@ -17,6 +17,14 @@
 	#define sleep_ms(ms)	Sleep(ms)
 #endif
 
+#ifdef _WIN32
+    #define ALIGNED_MALLOC(size, align) _aligned_malloc(size, align)
+    #define ALIGNED_FREE(ptr)           _aligned_free(ptr)
+#else
+    #define ALIGNED_MALLOC(size, align) aligned_alloc(align, size)
+    #define ALIGNED_FREE(ptr)           free(ptr)
+#endif
+
 #define _FILE_OFFSET_BITS 64
 
 #ifdef _WIN64
@@ -25,7 +33,7 @@
 #define FSEEK fseeko
 #endif
 
-#define NB_THREADS 4
+#define NB_THREADS 16
 
 typedef struct BresenhamMap BresenhamMap;
 struct BresenhamMap {
@@ -151,7 +159,7 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
     }
 }
 
-void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char *tmp_buf, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
+void process_files(const unsigned char * restrict in_buf, unsigned char * restrict out_buf, unsigned char * restrict tmp_buf,const BresenhamMap *  restrict map,const int in_w,const int in_h,const int out_w,const int out_h,const int ratio,const int mode)
 {
 	const int in_w3    = in_w * 3;
 	const int out_w3   = out_w * 3;
@@ -164,14 +172,14 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
 
 		for(int h=0; h<in_h; h++)
 		{
-			const unsigned char *src_row = in_buf  + h * in_w3;   // calculé une fois par ligne
+			const unsigned char * restrict src_row = in_buf  + h * in_w3;   // calculé une fois par ligne
 			unsigned char       *dst_row = tmp_buf + h * out_w3;
 
 			int px3 = 0;
 			for(int px=0; px<out_w; px++, px3+=3)  // px3 remplace px/3
 			{
-				int src_px     = map->w_src[map_w_base + px] * 3;
-				int is_bilinear = map->w_flag[map_w_base + px];
+				const int src_px     = map->w_src[map_w_base + px] * 3;
+				const int is_bilinear = map->w_flag[map_w_base + px];
 
 				if(bilinear && is_bilinear == 1 && src_px + 3 < in_w3)
 				{
@@ -199,15 +207,15 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
 
 		for(int px=0; px<out_h; px++)
 		{
-			int src_line   = map->h_src[map_h_base + px];
-			int is_bilinear = map->h_flag[map_h_base + px];
+			const int src_line   = map->h_src[map_h_base + px];
+			const int is_bilinear = map->h_flag[map_h_base + px];
 
 			unsigned char       *dst_row  = out_buf + offset + px * out_w3;
-			const unsigned char *tmp_row0 = tmp_buf + src_line * out_w3;
+			const unsigned char * restrict tmp_row0 = tmp_buf + src_line * out_w3;
 
 			if(bilinear && is_bilinear == 1 && src_line + 1 < in_h)
 			{
-				const unsigned char *tmp_row1 = tmp_row0 + out_w3;
+				const unsigned char * restrict tmp_row1 = tmp_row0 + out_w3;
 				for(int i=0; i<out_w3; i++)
 					dst_row[i] = (tmp_row0[i] + tmp_row1[i]) >> 1;  // ← SIMD-vectorisable
 			}
@@ -366,35 +374,35 @@ int main(int argc, char **argv)
 		map.w_length = out_w * frames_ratio;
 		map.h_length = out_h * frames_ratio;
 		
-		map.w_src  = malloc(map.w_length * sizeof(int));
-		map.w_flag = malloc(map.w_length * sizeof(int));
-		map.h_src  = malloc(map.h_length * sizeof(int));
-		map.h_flag = malloc(map.h_length * sizeof(int));
+		map.w_src  = ALIGNED_MALLOC(map.w_length * sizeof(int),64);
+		map.w_flag = ALIGNED_MALLOC(map.w_length * sizeof(int),64);
+		map.h_src  = ALIGNED_MALLOC(map.h_length * sizeof(int),64);
+		map.h_flag = ALIGNED_MALLOC(map.h_length * sizeof(int),64);
 		
 		int alloc_err = 0;
 		for(int t=0; t<NB_THREADS; t++)
 		{
-			in_buf[t] = malloc(in_buf_length);
-			out_buf[t] = malloc(out_buf_length);
-			tmp_buf[t] = malloc(out_w * in_h * 3);
+			in_buf[t] = ALIGNED_MALLOC(in_buf_length,64);
+			out_buf[t] = ALIGNED_MALLOC(out_buf_length,64);
+			tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3,64);
 			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL)
 				alloc_err = 1;
 		}
 		
 		if(!map.w_src || !map.w_flag || !map.h_src || !map.h_flag || alloc_err)//check allocation error
 		{
-			free(map.w_src);
-			free(map.w_flag);
-			free(map.h_src);
-			free(map.h_flag);
+			ALIGNED_FREE(map.w_src);
+			ALIGNED_FREE(map.w_flag);
+			ALIGNED_FREE(map.h_src);
+			ALIGNED_FREE(map.h_flag);
 			
 			for(int t=0; t<NB_THREADS; t++)
 			{
-				free(in_buf[t]);
-				free(out_buf[t]);
-				free(tmp_buf[t]);
+				ALIGNED_FREE(in_buf[t]);
+				ALIGNED_FREE(out_buf[t]);
+				ALIGNED_FREE(tmp_buf[t]);
 			}
-			fprintf(stderr, "malloc error (buf)\n");
+			fprintf(stderr, "ALIGNED_MALLOC error (buf)\n");
 			return -1;
 		}
 	}
@@ -493,15 +501,15 @@ int main(int argc, char **argv)
 
 ////ending of the program
 	
-	free(map.w_src);
-	free(map.w_flag);
-	free(map.h_src);
-	free(map.h_flag);
+	ALIGNED_FREE(map.w_src);
+	ALIGNED_FREE(map.w_flag);
+	ALIGNED_FREE(map.h_src);
+	ALIGNED_FREE(map.h_flag);
 	for(int t=0; t<NB_THREADS; t++)
 	{
-		free(in_buf[t]);
-		free(out_buf[t]);
-		free(tmp_buf[t]);
+		ALIGNED_FREE(in_buf[t]);
+		ALIGNED_FREE(out_buf[t]);
+		ALIGNED_FREE(tmp_buf[t]);
 	}
 	
 	//Close file
