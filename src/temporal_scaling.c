@@ -25,7 +25,7 @@
 #define FSEEK fseeko
 #endif
 
-#define NB_THREADS 16
+#define NB_THREADS 4
 
 typedef struct BresenhamMap BresenhamMap;
 struct BresenhamMap {
@@ -153,72 +153,73 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
 
 void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char *tmp_buf, BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio, int mode)
 {
+	const int in_w3    = in_w * 3;
+	const int out_w3   = out_w * 3;
+	const int bilinear = (mode >= 1);
     unsigned int offset = 0;
     for(int r=0; r<ratio; r++)
     {
         //scale the width line by line
-        for(int h=0; h<in_h; h++)
-        {
-            for(int px=0; px<(out_w*3); px+=3)
-            {
-                int src_px = map->w_src[r*out_w + px/3] * 3;
-                int is_bilinear_w = map->w_flag[r*out_w + px/3];
+        const int map_w_base = r * out_w;  // hissé hors des boucles
 
-                if(mode >= 1 && is_bilinear_w == 1 && src_px + 3 < in_w*3)
-                {
-                    // moyenne avec voisin droite
-                    tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px]   + in_buf[(h*in_w*3)+src_px+3])   / 2;
-                    tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px+1] + in_buf[(h*in_w*3)+src_px+4]) / 2;
-                    tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px+2] + in_buf[(h*in_w*3)+src_px+5]) / 2;
-                }
-                else if(mode >= 1 && is_bilinear_w == -1 && src_px - 3 >= 0)
-                {
-                    // moyenne avec voisin gauche
-                    tmp_buf[(h*out_w*3)+px]   = (in_buf[(h*in_w*3)+src_px-3] + in_buf[(h*in_w*3)+src_px])   / 2;
-                    tmp_buf[(h*out_w*3)+px+1] = (in_buf[(h*in_w*3)+src_px-2] + in_buf[(h*in_w*3)+src_px+1]) / 2;
-                    tmp_buf[(h*out_w*3)+px+2] = (in_buf[(h*in_w*3)+src_px-1] + in_buf[(h*in_w*3)+src_px+2]) / 2;
-                }
-                else
-                {
-                    tmp_buf[(h*out_w*3)+px]   = in_buf[(h*in_w*3)+src_px];
-                    tmp_buf[(h*out_w*3)+px+1] = in_buf[(h*in_w*3)+src_px+1];
-                    tmp_buf[(h*out_w*3)+px+2] = in_buf[(h*in_w*3)+src_px+2];
-                }
-            }
-        }
-
-        //scale the height line by line
-		for(int px=0; px<out_h; px++)
+		for(int h=0; h<in_h; h++)
 		{
-			int src_line = map->h_src[r*out_h + px];
-			int is_bilinear_h = map->h_flag[r*out_h + px];
-			
-			if(mode >= 1 && is_bilinear_h == 1 && src_line + 1 < in_h)
+			const unsigned char *src_row = in_buf  + h * in_w3;   // calculé une fois par ligne
+			unsigned char       *dst_row = tmp_buf + h * out_w3;
+
+			int px3 = 0;
+			for(int px=0; px<out_w; px++, px3+=3)  // px3 remplace px/3
 			{
-				for(int w=0; w<out_w; w++)
+				int src_px     = map->w_src[map_w_base + px] * 3;
+				int is_bilinear = map->w_flag[map_w_base + px];
+
+				if(bilinear && is_bilinear == 1 && src_px + 3 < in_w3)
 				{
-					out_buf[offset+(px*out_w+w)*3]   = (tmp_buf[(src_line*out_w+w)*3]   + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
-					out_buf[(offset+(px*out_w+w)*3)+1] = (tmp_buf[(src_line*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
-					out_buf[(offset+(px*out_w+w)*3)+2] = (tmp_buf[(src_line*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
+					dst_row[px3]   = (src_row[src_px]   + src_row[src_px+3]) >> 1;
+					dst_row[px3+1] = (src_row[src_px+1] + src_row[src_px+4]) >> 1;
+					dst_row[px3+2] = (src_row[src_px+2] + src_row[src_px+5]) >> 1;
+				}
+				else if(bilinear && is_bilinear == -1 && src_px >= 3)
+				{
+					dst_row[px3]   = (src_row[src_px-3] + src_row[src_px])   >> 1;
+					dst_row[px3+1] = (src_row[src_px-2] + src_row[src_px+1]) >> 1;
+					dst_row[px3+2] = (src_row[src_px-1] + src_row[src_px+2]) >> 1;
+				}
+				else
+				{
+					dst_row[px3]   = src_row[src_px];
+					dst_row[px3+1] = src_row[src_px+1];
+					dst_row[px3+2] = src_row[src_px+2];
 				}
 			}
-			else if(mode >= 1 && is_bilinear_h == -1 && src_line - 1 >= 0)
+		}
+
+        //scale the height line by line
+		const int map_h_base = r * out_h;
+
+		for(int px=0; px<out_h; px++)
+		{
+			int src_line   = map->h_src[map_h_base + px];
+			int is_bilinear = map->h_flag[map_h_base + px];
+
+			unsigned char       *dst_row  = out_buf + offset + px * out_w3;
+			const unsigned char *tmp_row0 = tmp_buf + src_line * out_w3;
+
+			if(bilinear && is_bilinear == 1 && src_line + 1 < in_h)
 			{
-				for(int w=0; w<out_w; w++)
-				{
-					out_buf[offset+(px*out_w+w)*3]   = (tmp_buf[((src_line-1)*out_w+w)*3]   + tmp_buf[(src_line*out_w+w)*3])   / 2;
-					out_buf[(offset+(px*out_w+w)*3)+1] = (tmp_buf[((src_line-1)*out_w+w)*3+1] + tmp_buf[(src_line*out_w+w)*3+1]) / 2;
-					out_buf[(offset+(px*out_w+w)*3)+2] = (tmp_buf[((src_line-1)*out_w+w)*3+2] + tmp_buf[(src_line*out_w+w)*3+2]) / 2;
-				}
+				const unsigned char *tmp_row1 = tmp_row0 + out_w3;
+				for(int i=0; i<out_w3; i++)
+					dst_row[i] = (tmp_row0[i] + tmp_row1[i]) >> 1;  // ← SIMD-vectorisable
+			}
+			else if(bilinear && is_bilinear == -1 && src_line >= 1)
+			{
+				const unsigned char *tmp_row_1 = tmp_row0 - out_w3;
+				for(int i=0; i<out_w3; i++)
+					dst_row[i] = (tmp_row_1[i] + tmp_row0[i]) >> 1;
 			}
 			else
 			{
-				for(int w=0; w<out_w; w++)
-				{
-					out_buf[offset+(px*out_w+w)*3]   = tmp_buf[(src_line*out_w+w)*3];
-					out_buf[(offset+(px*out_w+w)*3)+1] = tmp_buf[(src_line*out_w+w)*3+1];
-					out_buf[(offset+(px*out_w+w)*3)+2] = tmp_buf[(src_line*out_w+w)*3+2];
-				}
+				memcpy(dst_row, tmp_row0, out_w3);  // ← bien plus rapide que pixel par pixel
 			}
 		}
         offset += out_w*out_h*3;
@@ -255,6 +256,9 @@ int main(int argc, char **argv)
 	_setmode(_fileno(stdout), O_BINARY);
 	_setmode(_fileno(stdin), O_BINARY);	
 #endif
+
+	/*setvbuf(stdin,  NULL, _IOFBF, 64 * 1024 * 1024);  // 1MB
+	setvbuf(stdout, NULL, _IOFBF, 128 * 1024 * 1024);  // 4MB*/
 
 	int opt;
 
@@ -437,12 +441,12 @@ int main(int argc, char **argv)
 		pthread_create(&workers[t].tid, NULL, worker_loop, &workers[t]);
 	}
 
-	// --- boucle principale ---
-	while (!feof(input)) {
+	while (!feof(input))
+	{
 		int frames_read = 0;
 		for (int t = 0; t < NB_THREADS; t++) {
 			if (fread(in_buf[t], in_buf_length, 1, input) == 1) {
-				workers[t].args = args[t];
+				workers[t].args         = args[t];
 				workers[t].args.in_buf  = in_buf[t];
 				workers[t].args.out_buf = out_buf[t];
 				workers[t].args.tmp_buf = tmp_buf[t];
