@@ -28,10 +28,11 @@
 #define NB_THREADS 16
 
 typedef struct BresenhamMap BresenhamMap;
-struct BresenhamMap
-{
-    int (*w)[2];
-    int (*h)[2];
+struct BresenhamMap {
+    int *w_src;   // index source
+    int *w_flag;  // flag bilinear
+    int *h_src;
+    int *h_flag;
     int w_length;
     int h_length;
 };
@@ -45,6 +46,16 @@ struct ThreadArgs
 	BresenhamMap *map;
 	int in_w, in_h, out_w, out_h, ratio, mode;
 };
+
+typedef struct {
+    pthread_t      tid;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond_work;
+    pthread_cond_t  cond_done;
+    ThreadArgs      args;
+    int             ready;  // 1=travail, -1=exit, 0=repos
+    int             done;
+} Worker;
 
 void usage(void)
 {
@@ -80,14 +91,14 @@ void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int in_w, i
         // etape 1 : compte le chevauchement global
         int overlap = 0;
         for(int px=0; px<out_w; px++)
-            if(map->w[r*out_w+px][1] == 1 && map->w[(r-1)*out_w+px][1] == 1)
+            if(map->w_flag[r*out_w+px] == 1 && map->w_flag[(r-1)*out_w+px] == 1)
                 overlap++;
         
         // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
         if(overlap > out_w/2)
             for(int px=0; px<out_w; px++)
-                if(map->w[r*out_w+px][1] == 1)
-                    map->w[r*out_w+px][1] = -1;
+                if(map->w_flag[r*out_w+px] == 1)
+                    map->w_flag[r*out_w+px] = -1;
     }
 
     // ajustement axe vertical
@@ -96,14 +107,14 @@ void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int in_w, i
         // etape 1 : compte le chevauchement global
         int overlap = 0;
         for(int px=0; px<out_h; px++)
-            if(map->h[r*out_h+px][1] == 1 && map->h[(r-1)*out_h+px][1] == 1)
+            if(map->h_flag[r*out_h+px] == 1 && map->h_flag[(r-1)*out_h+px] == 1)
                 overlap++;
         
         // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
         if(overlap > out_h/2)
             for(int px=0; px<out_h; px++)
-                if(map->h[r*out_h+px][1] == 1)
-                    map->h[r*out_h+px][1] = -1;
+                if(map->h_flag[r*out_h+px] == 1)
+                    map->h_flag[r*out_h+px] = -1;
     }
 }
 
@@ -116,8 +127,8 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         int dst = r * out_w;
         for(int px = 0; px < out_w; px++)
         {
-            map->w[dst][0] = src;
-			map->w[dst][1] = (err > out_w / 2) ? 1 : 0;
+			map->w_src[dst]  = src;
+			map->w_flag[dst] = (err > out_w / 2) ? 1 : 0;
 			dst++;
             err += in_w;
             if(err >= out_w) { err -= out_w; src++; }
@@ -131,8 +142,8 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         int dst = r * out_h;
         for(int px = 0; px < out_h; px++)
         {
-            map->h[dst][0] = src;
-			map->h[dst][1] = (err > out_h / 2) ? 1 : 0;
+            map->h_src[dst]  = src;
+			map->h_flag[dst] = (err > out_h / 2) ? 1 : 0;
 			dst++;
             err += in_h;
             if(err >= out_h) { err -= out_h; src++; }
@@ -150,8 +161,8 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
         {
             for(int px=0; px<(out_w*3); px+=3)
             {
-                int src_px = map->w[r*out_w + px/3][0] * 3;
-                int is_bilinear_w = map->w[r*out_w + px/3][1];
+                int src_px = map->w_src[r*out_w + px/3] * 3;
+                int is_bilinear_w = map->w_flag[r*out_w + px/3];
 
                 if(mode >= 1 && is_bilinear_w == 1 && src_px + 3 < in_w*3)
                 {
@@ -179,8 +190,8 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
         //scale the height line by line
 		for(int px=0; px<out_h; px++)
 		{
-			int src_line = map->h[r*out_h + px][0];
-			int is_bilinear_h = map->h[r*out_h + px][1];
+			int src_line = map->h_src[r*out_h + px];
+			int is_bilinear_h = map->h_flag[r*out_h + px];
 			
 			if(mode >= 1 && is_bilinear_h == 1 && src_line + 1 < in_h)
 			{
@@ -214,11 +225,28 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
     }
 }
 
-void *thread_func(void *arg)
-{
-	ThreadArgs *a = (ThreadArgs *)arg;
-	process_files(a->in_buf, a->out_buf, a->tmp_buf, a->map, a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
-	return NULL;
+void *worker_loop(void *arg) {
+    Worker *w = (Worker *)arg;
+    while (1) {
+        pthread_mutex_lock(&w->mutex);
+        while (w->ready == 0)                    // attend un signal
+            pthread_cond_wait(&w->cond_work, &w->mutex);
+        int cmd = w->ready;
+        w->ready = 0;                            // ← reset ICI sous le mutex
+        pthread_mutex_unlock(&w->mutex);
+
+        if (cmd == -1) break;
+
+        ThreadArgs *a = &w->args;
+        process_files(a->in_buf, a->out_buf, a->tmp_buf, a->map,
+                      a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
+
+        pthread_mutex_lock(&w->mutex);
+        w->done = 1;
+        pthread_cond_signal(&w->cond_done);
+        pthread_mutex_unlock(&w->mutex);
+    }
+    return NULL;
 }
 
 int main(int argc, char **argv)
@@ -260,8 +288,10 @@ int main(int argc, char **argv)
 	unsigned int out_buf_length = 0;
 	
 	BresenhamMap map;
-	map.w = NULL;
-	map.h = NULL;
+	map.w_src = NULL;
+	map.w_flag = NULL;
+	map.h_src = NULL;
+	map.h_flag = NULL;
 	map.w_length = 0;
 	map.h_length = 0;
 	
@@ -332,8 +362,10 @@ int main(int argc, char **argv)
 		map.w_length = out_w * frames_ratio;
 		map.h_length = out_h * frames_ratio;
 		
-		map.w = (int (*)[2])malloc(map.w_length * 2 * sizeof(int));
-		map.h = (int (*)[2])malloc(map.h_length * 2 * sizeof(int));
+		map.w_src  = malloc(map.w_length * sizeof(int));
+		map.w_flag = malloc(map.w_length * sizeof(int));
+		map.h_src  = malloc(map.h_length * sizeof(int));
+		map.h_flag = malloc(map.h_length * sizeof(int));
 		
 		int alloc_err = 0;
 		for(int t=0; t<NB_THREADS; t++)
@@ -345,10 +377,13 @@ int main(int argc, char **argv)
 				alloc_err = 1;
 		}
 		
-		if(map.w == NULL || map.h == NULL || alloc_err)//check allocation error
+		if(!map.w_src || !map.w_flag || !map.h_src || !map.h_flag || alloc_err)//check allocation error
 		{
-			free(map.w);
-			free(map.h);
+			free(map.w_src);
+			free(map.w_flag);
+			free(map.h_src);
+			free(map.h_flag);
+			
 			for(int t=0; t<NB_THREADS; t++)
 			{
 				free(in_buf[t]);
@@ -391,46 +426,73 @@ int main(int argc, char **argv)
 		args[t].mode = mode;
 	}
 	
-	while(!feof(input))
-	{
-		//read NB_THREADS frames
+	// --- init thread pool ---
+	Worker workers[NB_THREADS];
+	for (int t = 0; t < NB_THREADS; t++) {
+		workers[t].ready = 0;
+		workers[t].done  = 0;
+		pthread_mutex_init(&workers[t].mutex, NULL);
+		pthread_cond_init(&workers[t].cond_work, NULL);
+		pthread_cond_init(&workers[t].cond_done, NULL);
+		pthread_create(&workers[t].tid, NULL, worker_loop, &workers[t]);
+	}
+
+	// --- boucle principale ---
+	while (!feof(input)) {
 		int frames_read = 0;
-		for(int t=0; t<NB_THREADS; t++)
-		{
-			if(fread(in_buf[t], in_buf_length, 1, input) == 1)
-			{
-				args[t].in_buf = in_buf[t];
-				args[t].out_buf = out_buf[t];
-				args[t].tmp_buf = tmp_buf[t];
+		for (int t = 0; t < NB_THREADS; t++) {
+			if (fread(in_buf[t], in_buf_length, 1, input) == 1) {
+				workers[t].args = args[t];
+				workers[t].args.in_buf  = in_buf[t];
+				workers[t].args.out_buf = out_buf[t];
+				workers[t].args.tmp_buf = tmp_buf[t];
 				frames_read++;
-			}
-			else break;
+			} else break;
 		}
-		
-		//launch threads
-		pthread_t threads[NB_THREADS];
-		for(int t=0; t<frames_read; t++)
-			pthread_create(&threads[t], NULL, thread_func, &args[t]);
-		
-		//wait for all threads
-		for(int t=0; t<frames_read; t++)
-			pthread_join(threads[t], NULL);
-		
-		//write to stdout (pipe)
-		if(isatty(STDOUT_FILENO) == 0)
-		{
-			for(int t=0; t<frames_read; t++)
-			{
+
+		// signal aux workers
+		for (int t = 0; t < frames_read; t++) {
+			pthread_mutex_lock(&workers[t].mutex);
+			workers[t].done  = 0;
+			workers[t].ready = 1;
+			pthread_cond_signal(&workers[t].cond_work);
+			pthread_mutex_unlock(&workers[t].mutex);
+		}
+
+		// attente
+		for (int t = 0; t < frames_read; t++) {
+			pthread_mutex_lock(&workers[t].mutex);
+			while (!workers[t].done)
+				pthread_cond_wait(&workers[t].cond_done, &workers[t].mutex);
+			pthread_mutex_unlock(&workers[t].mutex);
+		}
+
+		// écriture
+		if (!isatty(STDOUT_FILENO)) {
+			for (int t = 0; t < frames_read; t++)
 				fwrite(out_buf[t], out_buf_length, 1, stdout);
-			}
 			fflush(stdout);
 		}
 	}
 
+	// --- arrêt thread pool ---
+	for (int t = 0; t < NB_THREADS; t++) {
+		pthread_mutex_lock(&workers[t].mutex);
+		workers[t].ready = -1;
+		pthread_cond_signal(&workers[t].cond_work);
+		pthread_mutex_unlock(&workers[t].mutex);
+		pthread_join(workers[t].tid, NULL);
+		pthread_mutex_destroy(&workers[t].mutex);
+		pthread_cond_destroy(&workers[t].cond_work);
+		pthread_cond_destroy(&workers[t].cond_done);
+	}
+
 ////ending of the program
 	
-	free(map.w);
-	free(map.h);
+	free(map.w_src);
+	free(map.w_flag);
+	free(map.h_src);
+	free(map.h_flag);
 	for(int t=0; t<NB_THREADS; t++)
 	{
 		free(in_buf[t]);
