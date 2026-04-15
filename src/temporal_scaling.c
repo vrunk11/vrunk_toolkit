@@ -25,7 +25,7 @@
 #define FSEEK fseeko
 #endif
 
-#define NB_THREADS 6
+#define NB_THREADS 16
 
 typedef struct BresenhamMap BresenhamMap;
 struct BresenhamMap
@@ -176,36 +176,40 @@ void process_files(unsigned char *in_buf, unsigned char *out_buf, unsigned char 
             }
         }
 
-        //scale the height column by column
-        for(int w=0; w<out_w; w++)
-        {
-            for(int px=0; px<(out_h*3); px+=3)
-            {
-                int src_line = map->h[r*out_h + px/3][0];
-                int is_bilinear_h = map->h[r*out_h + px/3][1];
-
-                if(mode >= 1 && is_bilinear_h == 1 && src_line + 1 < in_h)
-                {
-                    // moyenne avec ligne du dessous
-                    out_buf[offset+(px/3*out_w+w)*3]     = (tmp_buf[(src_line*out_w+w)*3]     + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
-                    out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line)*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
-                    out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line)*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
-                }
-                else if(mode >= 1 && is_bilinear_h == -1 && src_line - 1 >= 0)
-                {
-                    // moyenne avec ligne du dessus
-                    out_buf[offset+(px/3*out_w+w)*3]     = (tmp_buf[((src_line-1)*out_w+w)*3]     + tmp_buf[(src_line*out_w+w)*3])   / 2;
-                    out_buf[(offset+(px/3*out_w+w)*3)+1] = (tmp_buf[((src_line-1)*out_w+w)*3+1] + tmp_buf[((src_line)*out_w+w)*3+1]) / 2;
-                    out_buf[(offset+(px/3*out_w+w)*3)+2] = (tmp_buf[((src_line-1)*out_w+w)*3+2] + tmp_buf[((src_line)*out_w+w)*3+2]) / 2;
-                }
-                else
-                {
-                    out_buf[offset+(px/3*out_w+w)*3]     = tmp_buf[(src_line*out_w+w)*3];
-                    out_buf[(offset+(px/3*out_w+w)*3)+1] = tmp_buf[((src_line)*out_w+w)*3+1];
-                    out_buf[(offset+(px/3*out_w+w)*3)+2] = tmp_buf[((src_line)*out_w+w)*3+2];
-                }
-            }
-        }
+        //scale the height line by line
+		for(int px=0; px<out_h; px++)
+		{
+			int src_line = map->h[r*out_h + px][0];
+			int is_bilinear_h = map->h[r*out_h + px][1];
+			
+			if(mode >= 1 && is_bilinear_h == 1 && src_line + 1 < in_h)
+			{
+				for(int w=0; w<out_w; w++)
+				{
+					out_buf[offset+(px*out_w+w)*3]   = (tmp_buf[(src_line*out_w+w)*3]   + tmp_buf[((src_line+1)*out_w+w)*3])   / 2;
+					out_buf[(offset+(px*out_w+w)*3)+1] = (tmp_buf[(src_line*out_w+w)*3+1] + tmp_buf[((src_line+1)*out_w+w)*3+1]) / 2;
+					out_buf[(offset+(px*out_w+w)*3)+2] = (tmp_buf[(src_line*out_w+w)*3+2] + tmp_buf[((src_line+1)*out_w+w)*3+2]) / 2;
+				}
+			}
+			else if(mode >= 1 && is_bilinear_h == -1 && src_line - 1 >= 0)
+			{
+				for(int w=0; w<out_w; w++)
+				{
+					out_buf[offset+(px*out_w+w)*3]   = (tmp_buf[((src_line-1)*out_w+w)*3]   + tmp_buf[(src_line*out_w+w)*3])   / 2;
+					out_buf[(offset+(px*out_w+w)*3)+1] = (tmp_buf[((src_line-1)*out_w+w)*3+1] + tmp_buf[(src_line*out_w+w)*3+1]) / 2;
+					out_buf[(offset+(px*out_w+w)*3)+2] = (tmp_buf[((src_line-1)*out_w+w)*3+2] + tmp_buf[(src_line*out_w+w)*3+2]) / 2;
+				}
+			}
+			else
+			{
+				for(int w=0; w<out_w; w++)
+				{
+					out_buf[offset+(px*out_w+w)*3]   = tmp_buf[(src_line*out_w+w)*3];
+					out_buf[(offset+(px*out_w+w)*3)+1] = tmp_buf[(src_line*out_w+w)*3+1];
+					out_buf[(offset+(px*out_w+w)*3)+2] = tmp_buf[(src_line*out_w+w)*3+2];
+				}
+			}
+		}
         offset += out_w*out_h*3;
     }
 }
@@ -374,11 +378,6 @@ int main(int argc, char **argv)
 	{
 		adjust_bilinear_phases(&map, out_w, out_h, in_w, in_h, frames_ratio);
 	}
-	
-	pthread_t thread_1;
-	pthread_t thread_2;
-	pthread_t thread_3;
-	pthread_t thread_4;
 	
 	ThreadArgs args[NB_THREADS];
 	for(int t=0; t<NB_THREADS; t++)
