@@ -57,9 +57,12 @@ typedef struct ThreadArgs ThreadArgs;
 struct ThreadArgs
 {
 	unsigned char *in_buf;
+	unsigned char *next_buf;   // frame d'entrée suivante pour blend temporel
 	unsigned char *out_buf;
 	unsigned char *tmp_buf;
+	unsigned char *blend_buf;  // résultat du lerp temporel (taille in_w*in_h*3)
 	BresenhamMap *map;
+	const int *tmp_weights;    // poids temporel par phase (taille = ratio)
 	int in_w, in_h, out_w, out_h, ratio, mode;
 };
 
@@ -91,7 +94,12 @@ void usage(void)
         "\t                     2 = bilinear with temporal alternation\n"
         "\t                     3 = linear weighted bilinear with temporal alternation\n"
         "\t                     4 = exponential weighted bilinear with temporal alternation\n"
-        "\t--curve-base FLOAT exponential curve base for mode 4 (default: 2.0, must be > 1.0)\n\n"
+        "\t--tmp-mode INT     temporal blending mode (default: 0)\n"
+        "\t                     0 = duplicate frames (no blending)\n"
+        "\t                     1 = blend 50%% on the upper minority of phases\n"
+        "\t                     2 = linear weighted blending\n"
+        "\t                     3 = exponential weighted blending (uses --curve-base)\n"
+        "\t--curve-base FLOAT exponential curve base for mode 4 / tmp-mode 3 (default: 2.0, must be > 1.0)\n\n"
     );
     exit(1);
 }
@@ -102,38 +110,166 @@ const char *get_filename_ext(const char *filename) {
     return dot + 1;
 }
 
-void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int in_w, int in_h, int ratio)
+// Alternance de phase spatiale par parité.
+//
+// Les phases impaires (r=1,3,5...) inversent leur direction d'interpolation
+// (flag +1 → -1). Cela garantit une alternance systématique gauche/droite
+// entre frames de sortie consécutives, quel que soit le ratio spatial ou
+// temporel.
+//
+// L'ancienne approche par overlap (comparer r avec r-1 et flipper si > 50%)
+// créait des flips isolés dans les cas dégénérés (ex: ratio spatial = ratio
+// temporel = entier), produisant un combing visible. Exemple : fps-ratio=5
+// et scaling x5 → seule la phase 4 était flippée, créant une inversion
+// brutale toutes les 5 frames.
+void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int ratio)
 {
-    // ajustement axe horizontal
-    for(int r=1; r<ratio; r++)
+    // Phases impaires : déplacer l'interpolation du bout du run vers le
+    // début, avec flag=-1 (blend vers le voisin précédent). Le nombre
+    // de pixels interpolés reste identique à la phase paire correspondante.
+
+    // axe horizontal
+    for(int r = 1; r < ratio; r += 2)
     {
-        // etape 1 : compte le chevauchement global
-        int overlap = 0;
-        for(int px=0; px<out_w; px++)
-            if(map->w_flag[r*out_w+px] == 1 && map->w_flag[(r-1)*out_w+px] == 1)
-                overlap++;
-        
-        // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
-        if(overlap > out_w/2)
-            for(int px=0; px<out_w; px++)
-                if(map->w_flag[r*out_w+px] == 1)
-                    map->w_flag[r*out_w+px] = -1;
+        const int base = r * out_w;
+        int run_start = 0;
+        while(run_start < out_w)
+        {
+            const int src = map->w_src[base + run_start];
+            int run_end = run_start + 1;
+            while(run_end < out_w && map->w_src[base + run_end] == src)
+                run_end++;
+
+            const int N = run_end - run_start;
+            int n_interp = 0;
+            for(int i = 0; i < N; i++)
+                if(map->w_flag[base + run_start + i] != 0)
+                    n_interp++;
+
+            for(int i = 0; i < N; i++)
+                map->w_flag[base + run_start + i] = (i < n_interp) ? -1 : 0;
+
+            run_start = run_end;
+        }
     }
 
-    // ajustement axe vertical
-    for(int r=1; r<ratio; r++)
+    // axe vertical
+    for(int r = 1; r < ratio; r += 2)
     {
-        // etape 1 : compte le chevauchement global
-        int overlap = 0;
-        for(int px=0; px<out_h; px++)
-            if(map->h_flag[r*out_h+px] == 1 && map->h_flag[(r-1)*out_h+px] == 1)
-                overlap++;
-        
-        // etape 2 : si trop de chevauchement on inverse tous les 1 en -1
-        if(overlap > out_h/2)
-            for(int px=0; px<out_h; px++)
-                if(map->h_flag[r*out_h+px] == 1)
-                    map->h_flag[r*out_h+px] = -1;
+        const int base = r * out_h;
+        int run_start = 0;
+        while(run_start < out_h)
+        {
+            const int src = map->h_src[base + run_start];
+            int run_end = run_start + 1;
+            while(run_end < out_h && map->h_src[base + run_end] == src)
+                run_end++;
+
+            const int N = run_end - run_start;
+            int n_interp = 0;
+            for(int i = 0; i < N; i++)
+                if(map->h_flag[base + run_start + i] != 0)
+                    n_interp++;
+
+            for(int i = 0; i < N; i++)
+                map->h_flag[base + run_start + i] = (i < n_interp) ? -1 : 0;
+
+            run_start = run_end;
+        }
+    }
+}
+
+// Variante de adjust_bilinear_phases pour les modes 3/4 :
+// le critère de chevauchement utilise w_heavy/h_heavy (pixels dans la
+// moitié haute du run, ie. ceux fortement interpolés) au lieu de w_flag.
+// On veut basculer la direction quand les "vraies" interpolations s'alignent
+// entre phases consécutives, pas quand les pixels juste légèrement
+// interpolés s'alignent (sinon on flip presque toujours).
+void adjust_bilinear_phases_weighted(BresenhamMap *map, int out_w, int out_h, int ratio)
+{
+    // axe horizontal
+    for(int r = 1; r < ratio; r += 2)
+    {
+        const int base = r * out_w;
+        int run_start = 0;
+        while(run_start < out_w)
+        {
+            const int src = map->w_src[base + run_start];
+            int run_end = run_start + 1;
+            while(run_end < out_w && map->w_src[base + run_end] == src)
+                run_end++;
+
+            const int N = run_end - run_start;
+
+            if(N == 1)
+            {
+                // Run d'un seul pixel : juste flipper la direction
+                if(map->w_flag[base + run_start] == 1)
+                    map->w_flag[base + run_start] = -1;
+            }
+            else
+            {
+                // Sauvegarder les poids/heavy originaux
+                int tmp_w[N], tmp_h[N];
+                for(int i = 0; i < N; i++)
+                {
+                    tmp_w[i] = map->w_weight[base + run_start + i];
+                    tmp_h[i] = map->w_heavy [base + run_start + i];
+                }
+
+                // Miroiter : le dernier poids va au premier, etc.
+                for(int i = 0; i < N; i++)
+                {
+                    int mi = N - 1 - i;
+                    map->w_weight[base + run_start + i] = tmp_w[mi];
+                    map->w_heavy [base + run_start + i] = tmp_h[mi];
+                    map->w_flag  [base + run_start + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                }
+            }
+
+            run_start = run_end;
+        }
+    }
+
+    // axe vertical
+    for(int r = 1; r < ratio; r += 2)
+    {
+        const int base = r * out_h;
+        int run_start = 0;
+        while(run_start < out_h)
+        {
+            const int src = map->h_src[base + run_start];
+            int run_end = run_start + 1;
+            while(run_end < out_h && map->h_src[base + run_end] == src)
+                run_end++;
+
+            const int N = run_end - run_start;
+
+            if(N == 1)
+            {
+                if(map->h_flag[base + run_start] == 1)
+                    map->h_flag[base + run_start] = -1;
+            }
+            else
+            {
+                int tmp_w[N], tmp_h[N];
+                for(int i = 0; i < N; i++)
+                {
+                    tmp_w[i] = map->h_weight[base + run_start + i];
+                    tmp_h[i] = map->h_heavy [base + run_start + i];
+                }
+
+                for(int i = 0; i < N; i++)
+                {
+                    int mi = N - 1 - i;
+                    map->h_weight[base + run_start + i] = tmp_w[mi];
+                    map->h_heavy [base + run_start + i] = tmp_h[mi];
+                    map->h_flag  [base + run_start + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                }
+            }
+
+            run_start = run_end;
+        }
     }
 }
 
@@ -174,6 +310,72 @@ typedef enum {
     CURVE_EXPONENTIAL = 0,  // mode 3
     CURVE_LINEAR      = 1   // mode 4
 } CurveType;
+
+typedef enum {
+    TMP_DUPLICATE   = 0,  // pas de blend, comportement par défaut
+    TMP_HALF        = 1,  // blend 50% sur la minorité supérieure des phases
+    TMP_LINEAR      = 2,  // poids linéaire i/R
+    TMP_EXPONENTIAL = 3   // poids exponentiel (base^i - 1) / base^(R-1)
+} TmpMode;
+
+// Pré-calcule les poids temporels (en virgule fixe 0..WEIGHT_MAX) pour
+// chaque phase r ∈ [0, R-1]. w=0 => pas de blend (frame source pure).
+//
+// Logique miroir du spatial :
+//   TMP_HALF        : seules les floor(R/2) dernières phases sont blendées
+//                     à 50%, le reste reste pur. Garantit qu'au moins la
+//                     moitié des frames produites sont identiques à la
+//                     frame source originale (plus de poids à l'original
+//                     qu'à l'interpolation).
+//   TMP_LINEAR      : w_r = r / R
+//   TMP_EXPONENTIAL : w_r = (base^r - 1) / base^(R-1), 1ère moitié quasi
+//                     identique à la source, cassure sur la fin.
+//
+// Exemples :
+//   R=3 mode 1 : 0%, 0%, 50%
+//   R=3 mode 2 : 0%, 33%, 67%
+//   R=3 mode 3 base=2 : 0%, 25%, 75%
+//   R=4 mode 1 : 0%, 0%, 50%, 50%
+//   R=4 mode 2 : 0%, 25%, 50%, 75%
+//   R=4 mode 3 base=2 : 0%, 12.5%, 37.5%, 87.5%
+void compute_temporal_weights(int *tmp_weights, int ratio, TmpMode mode, double base)
+{
+    if(ratio <= 1)
+    {
+        if(ratio == 1) tmp_weights[0] = 0;
+        return;
+    }
+
+    if(mode == TMP_DUPLICATE)
+    {
+        for(int r = 0; r < ratio; r++) tmp_weights[r] = 0;
+        return;
+    }
+
+    if(mode == TMP_HALF)
+    {
+        const int threshold = (ratio + 1) / 2;  // ceil(R/2)
+        for(int r = 0; r < ratio; r++)
+            tmp_weights[r] = (r >= threshold) ? (WEIGHT_MAX / 2) : 0;
+        return;
+    }
+
+    // TMP_LINEAR ou TMP_EXPONENTIAL
+    const double denom = (mode == TMP_EXPONENTIAL) ? pow(base, (double)(ratio - 1)) : 1.0;
+    for(int r = 0; r < ratio; r++)
+    {
+        double w;
+        if(mode == TMP_LINEAR)
+            w = (double)r / (double)ratio;
+        else  // TMP_EXPONENTIAL
+            w = (pow(base, (double)r) - 1.0) / denom;
+
+        int wi = (int)(w * WEIGHT_MAX + 0.5);
+        if(wi < 0)          wi = 0;
+        if(wi > WEIGHT_MAX) wi = WEIGHT_MAX;
+        tmp_weights[r] = wi;
+    }
+}
 
 // Mode 3/4 : pondération par run de pixels dupliqués.
 //
@@ -310,58 +512,49 @@ void compute_curve_weights(BresenhamMap *map, int out_w, int out_h, int ratio,
     }
 }
 
-// Variante de adjust_bilinear_phases pour le mode 3 :
-// le critère de chevauchement utilise w_heavy/h_heavy (pixels dans la
-// moitié haute du run, ie. ceux fortement interpolés) au lieu de w_flag.
-// On veut basculer la direction quand les "vraies" interpolations s'alignent
-// entre phases consécutives, pas quand les pixels juste légèrement
-// interpolés s'alignent (sinon on flip presque toujours).
-void adjust_bilinear_phases_weighted(BresenhamMap *map, int out_w, int out_h, int ratio)
-{
-    // axe horizontal
-    for(int r = 1; r < ratio; r++)
-    {
-        int overlap = 0;
-        for(int px = 0; px < out_w; px++)
-            if(map->w_heavy[r*out_w + px] && map->w_heavy[(r-1)*out_w + px])
-                overlap++;
-
-        if(overlap > out_w / 2)
-            for(int px = 0; px < out_w; px++)
-                if(map->w_flag[r*out_w + px] == 1)
-                    map->w_flag[r*out_w + px] = -1;
-    }
-
-    // axe vertical
-    for(int r = 1; r < ratio; r++)
-    {
-        int overlap = 0;
-        for(int px = 0; px < out_h; px++)
-            if(map->h_heavy[r*out_h + px] && map->h_heavy[(r-1)*out_h + px])
-                overlap++;
-
-        if(overlap > out_h / 2)
-            for(int px = 0; px < out_h; px++)
-                if(map->h_flag[r*out_h + px] == 1)
-                    map->h_flag[r*out_h + px] = -1;
-    }
-}
-
-void process_files(const unsigned char * restrict in_buf, unsigned char * restrict out_buf, unsigned char * restrict tmp_buf,const BresenhamMap *  restrict map,const int in_w,const int in_h,const int out_w,const int out_h,const int ratio,const int mode)
+void process_files(const unsigned char * restrict in_buf,
+                   const unsigned char * restrict next_buf,
+                   unsigned char * restrict blend_buf,
+                   unsigned char * restrict out_buf,
+                   unsigned char * restrict tmp_buf,
+                   const BresenhamMap *  restrict map,
+                   const int *tmp_weights,
+                   const int in_w,const int in_h,const int out_w,const int out_h,const int ratio,const int mode)
 {
 	const int in_w3    = in_w * 3;
 	const int out_w3   = out_w * 3;
+	const int in_size  = in_w * in_h * 3;
 	const int bilinear = (mode >= 1);
 	const int weighted = (mode == 3 || mode == 4);
     unsigned int offset = 0;
     for(int r=0; r<ratio; r++)
     {
+        // Blend temporel : si w_r > 0, fusionne in_buf et next_buf dans
+        // blend_buf, et utilise blend_buf comme source du scaling spatial.
+        // Sinon, on travaille directement sur in_buf (zéro copie).
+        // NB : src_buf n'a PAS de restrict car il peut aliaser in_buf
+        // (qui est restrict). Sinon c'est UB et le compilateur produit
+        // des optimisations incorrectes (path mode 2 cassé).
+        const int tw = tmp_weights[r];
+        const unsigned char *src_buf;
+        if(tw > 0 && next_buf != in_buf)
+        {
+            const int itw = WEIGHT_MAX - tw;
+            for(int i = 0; i < in_size; i++)
+                blend_buf[i] = (in_buf[i] * itw + next_buf[i] * tw) >> WEIGHT_SHIFT;
+            src_buf = blend_buf;
+        }
+        else
+        {
+            src_buf = in_buf;
+        }
+
         //scale the width line by line
         const int map_w_base = r * out_w;  // hissé hors des boucles
 
 		for(int h=0; h<in_h; h++)
 		{
-			const unsigned char * restrict src_row = in_buf  + h * in_w3;   // calculé une fois par ligne
+			const unsigned char * restrict src_row = src_buf + h * in_w3;   // calculé une fois par ligne
 			unsigned char       *dst_row = tmp_buf + h * out_w3;
 
 			int px3 = 0;
@@ -482,7 +675,8 @@ void *worker_loop(void *arg) {
         if (cmd == -1) break;
 
         ThreadArgs *a = &w->args;
-        process_files(a->in_buf, a->out_buf, a->tmp_buf, a->map,
+        process_files(a->in_buf, a->next_buf, a->blend_buf, a->out_buf, a->tmp_buf,
+                      a->map, a->tmp_weights,
                       a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
 
         pthread_mutex_lock(&w->mutex);
@@ -518,18 +712,25 @@ int main(int argc, char **argv)
 	int out_h = 1080;
 	int frames_ratio = 2;
 	int mode = 0;
-	double curve_base = 2.0;  // base de la courbe exponentielle (mode 3)
+	int tmp_mode = 0;         // mode de blending temporel (0 = duplication)
+	double curve_base = 2.0;  // base de la courbe exponentielle (modes 4 / tmp 3)
+	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	
-	//buffer
-	unsigned char *in_buf[NB_THREADS];
+	//buffer : in_buf a 1 slot supplémentaire pour le look-ahead temporel.
+	//in_buf[NB_THREADS] est la frame "next" du dernier worker, qui devient
+	//in_buf[0] (current du worker 0) du batch suivant.
+	unsigned char *in_buf[NB_THREADS + 1];
 	unsigned char *out_buf[NB_THREADS];
 	unsigned char *tmp_buf[NB_THREADS];
+	unsigned char *blend_buf[NB_THREADS];  // buffer du lerp temporel par worker
 	for(int t=0; t<NB_THREADS; t++)
 	{
-		in_buf[t] = NULL;
-		out_buf[t] = NULL;
-		tmp_buf[t] = NULL;
+		in_buf[t]    = NULL;
+		out_buf[t]   = NULL;
+		tmp_buf[t]   = NULL;
+		blend_buf[t] = NULL;
 	}
+	in_buf[NB_THREADS] = NULL;
 	
 	//buffer length
 	unsigned int in_buf_length = 0;
@@ -556,6 +757,7 @@ int main(int argc, char **argv)
 		{"fps-ratio",  1, 0, 5},
 		{"mode",       1, 0, 6},
 		{"curve-base", 1, 0, 7},
+		{"tmp-mode",   1, 0, 8},
 		{0, 0, 0, 0}//reminder : letter value are from 65 to 122
 	};
 
@@ -585,6 +787,9 @@ int main(int argc, char **argv)
 		case 7:
 			curve_base = atof(optarg);
 			break;
+		case 8:
+			tmp_mode = atoi(optarg);
+			break;
 		default:
 			usage();
 			break;
@@ -603,7 +808,13 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(mode == 4 && curve_base <= 1.0)
+	if(tmp_mode < 0 || tmp_mode > 3)
+	{
+		fprintf(stderr, "Error : tmp-mode '%d' is not supported\n", tmp_mode);
+		return -1;
+	}
+	
+	if((mode == 4 || tmp_mode == 3) && curve_base <= 1.0)
 	{
 		fprintf(stderr, "Error : --curve-base must be > 1.0 (got %f)\n", curve_base);
 		return -1;
@@ -646,12 +857,20 @@ int main(int argc, char **argv)
 		int alloc_err = 0;
 		for(int t=0; t<NB_THREADS; t++)
 		{
-			in_buf[t]  = ALIGNED_MALLOC(in_buf_length, 64);
-			out_buf[t] = ALIGNED_MALLOC(out_buf_length, 64);
-			tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3, 64);
-			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL)
+			in_buf[t]    = ALIGNED_MALLOC(in_buf_length, 64);
+			out_buf[t]   = ALIGNED_MALLOC(out_buf_length, 64);
+			tmp_buf[t]   = ALIGNED_MALLOC(out_w * in_h * 3, 64);
+			blend_buf[t] = ALIGNED_MALLOC(in_buf_length, 64);
+			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL || blend_buf[t] == NULL)
 				alloc_err = 1;
 		}
+		// Slot supplémentaire pour le look-ahead temporel
+		in_buf[NB_THREADS] = ALIGNED_MALLOC(in_buf_length, 64);
+		if(in_buf[NB_THREADS] == NULL) alloc_err = 1;
+
+		// Table des poids temporels (1 entry par phase)
+		tmp_weights = ALIGNED_MALLOC(frames_ratio * sizeof(int), 64);
+		if(tmp_weights == NULL) alloc_err = 1;
 		
 		if(!map.w_src || !map.w_flag || !map.w_weight || !map.w_heavy ||
 		   !map.h_src || !map.h_flag || !map.h_weight || !map.h_heavy || alloc_err)//check allocation error
@@ -664,13 +883,16 @@ int main(int argc, char **argv)
 			ALIGNED_FREE(map.h_flag);
 			ALIGNED_FREE(map.h_weight);
 			ALIGNED_FREE(map.h_heavy);
+			ALIGNED_FREE(tmp_weights);
 			
 			for(int t=0; t<NB_THREADS; t++)
 			{
 				ALIGNED_FREE(in_buf[t]);
 				ALIGNED_FREE(out_buf[t]);
 				ALIGNED_FREE(tmp_buf[t]);
+				ALIGNED_FREE(blend_buf[t]);
 			}
+			ALIGNED_FREE(in_buf[NB_THREADS]);
 			fprintf(stderr, "ALIGNED_MALLOC error (buf)\n");
 			return -1;
 		}
@@ -696,19 +918,23 @@ int main(int argc, char **argv)
 	}
 	else if(mode == 2)
 	{
-		adjust_bilinear_phases(&map, out_w, out_h, in_w, in_h, frames_ratio);
+		adjust_bilinear_phases(&map, out_w, out_h, frames_ratio);
 	}
+
+	// Pré-calcul des poids temporels (une fois pour toute la vidéo)
+	compute_temporal_weights(tmp_weights, frames_ratio, (TmpMode)tmp_mode, curve_base);
 	
 	ThreadArgs args[NB_THREADS];
 	for(int t=0; t<NB_THREADS; t++)
 	{
-		args[t].map   = &map;
-		args[t].in_w  = in_w;
-		args[t].in_h  = in_h;
-		args[t].out_w = out_w;
-		args[t].out_h = out_h;
-		args[t].ratio = frames_ratio;
-		args[t].mode  = mode;
+		args[t].map         = &map;
+		args[t].tmp_weights = tmp_weights;
+		args[t].in_w        = in_w;
+		args[t].in_h        = in_h;
+		args[t].out_w       = out_w;
+		args[t].out_h       = out_h;
+		args[t].ratio       = frames_ratio;
+		args[t].mode        = mode;
 	}
 	
 	// --- init thread pool ---
@@ -722,21 +948,47 @@ int main(int argc, char **argv)
 		pthread_create(&workers[t].tid, NULL, worker_loop, &workers[t]);
 	}
 
-	while (!feof(input))
+	// Pré-lecture de la frame 0 dans in_buf[0]. Si vide, on saute la boucle.
+	int has_current = (fread(in_buf[0], in_buf_length, 1, input) == 1);
+
+	while (has_current)
 	{
-		int frames_read = 0;
-		for (int t = 0; t < NB_THREADS; t++) {
-			if (fread(in_buf[t], in_buf_length, 1, input) == 1) {
-				workers[t].args         = args[t];
-				workers[t].args.in_buf  = in_buf[t];
-				workers[t].args.out_buf = out_buf[t];
-				workers[t].args.tmp_buf = tmp_buf[t];
-				frames_read++;
-			} else break;
+		// On a déjà 1 frame valide dans in_buf[0]. Lire jusqu'à NB_THREADS
+		// frames supplémentaires dans in_buf[1..NB_THREADS]. Le dernier slot
+		// (NB_THREADS) sert de "next" pour le worker NB_THREADS-1 et sera
+		// recyclé comme "current" du worker 0 du batch suivant.
+		int frames_loaded = 1;  // in_buf[0] déjà chargé
+		for (int t = 1; t <= NB_THREADS; t++) {
+			if (fread(in_buf[t], in_buf_length, 1, input) == 1)
+				frames_loaded++;
+			else
+				break;
+		}
+
+		// Nombre de workers à dispatcher : on a frames_loaded frames valides,
+		// on en traite jusqu'à NB_THREADS. Si frames_loaded == NB_THREADS+1
+		// le dernier worker a un vrai "next" ; sinon le dernier worker
+		// utilise son current comme next (blend trivial = current).
+		int frames_to_process = (frames_loaded > NB_THREADS) ? NB_THREADS : frames_loaded;
+		int has_full_lookahead = (frames_loaded == NB_THREADS + 1);
+
+		for (int t = 0; t < frames_to_process; t++) {
+			workers[t].args           = args[t];
+			workers[t].args.in_buf    = in_buf[t];
+			workers[t].args.out_buf   = out_buf[t];
+			workers[t].args.tmp_buf   = tmp_buf[t];
+			workers[t].args.blend_buf = blend_buf[t];
+			// "next" = frame suivante si dispo, sinon current (= no-op blend)
+			if (t < frames_to_process - 1)
+				workers[t].args.next_buf = in_buf[t + 1];
+			else if (has_full_lookahead)
+				workers[t].args.next_buf = in_buf[NB_THREADS];
+			else
+				workers[t].args.next_buf = in_buf[t];  // dernière frame du fichier
 		}
 
 		// signal aux workers
-		for (int t = 0; t < frames_read; t++) {
+		for (int t = 0; t < frames_to_process; t++) {
 			pthread_mutex_lock(&workers[t].mutex);
 			workers[t].done  = 0;
 			workers[t].ready = 1;
@@ -745,7 +997,7 @@ int main(int argc, char **argv)
 		}
 
 		// attente
-		for (int t = 0; t < frames_read; t++) {
+		for (int t = 0; t < frames_to_process; t++) {
 			pthread_mutex_lock(&workers[t].mutex);
 			while (!workers[t].done)
 				pthread_cond_wait(&workers[t].cond_done, &workers[t].mutex);
@@ -754,9 +1006,21 @@ int main(int argc, char **argv)
 
 		// écriture
 		if (!isatty(STDOUT_FILENO)) {
-			for (int t = 0; t < frames_read; t++)
+			for (int t = 0; t < frames_to_process; t++)
 				fwrite(out_buf[t], out_buf_length, 1, stdout);
 			fflush(stdout);
+		}
+
+		// Préparer le batch suivant : si on avait un look-ahead complet, la
+		// frame in_buf[NB_THREADS] devient le current du worker 0 du prochain
+		// batch (swap des pointeurs pour éviter la copie).
+		if (has_full_lookahead) {
+			unsigned char *swap = in_buf[0];
+			in_buf[0] = in_buf[NB_THREADS];
+			in_buf[NB_THREADS] = swap;
+			has_current = 1;
+		} else {
+			has_current = 0;  // EOF déjà atteint, on sort
 		}
 	}
 
@@ -782,12 +1046,15 @@ int main(int argc, char **argv)
 	ALIGNED_FREE(map.h_flag);
 	ALIGNED_FREE(map.h_weight);
 	ALIGNED_FREE(map.h_heavy);
+	ALIGNED_FREE(tmp_weights);
 	for(int t=0; t<NB_THREADS; t++)
 	{
 		ALIGNED_FREE(in_buf[t]);
 		ALIGNED_FREE(out_buf[t]);
 		ALIGNED_FREE(tmp_buf[t]);
+		ALIGNED_FREE(blend_buf[t]);
 	}
+	ALIGNED_FREE(in_buf[NB_THREADS]);
 	
 	//Close file
 	if (input && (input != stdin))
