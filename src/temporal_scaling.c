@@ -76,6 +76,92 @@ typedef struct {
     int             done;
 } Worker;
 
+//    LUT GLOBALE — 4 poids kaiser pour chaque position fractionnaire
+//    Taille : (WEIGHT_MAX+1) * 4 * sizeof(int) = 4KB, négligeable.
+//    Précalculée une fois au démarrage dans main().
+ 
+static int kaiser4_lut[WEIGHT_MAX + 1][4];
+ 
+// sinc normalisé : sinc(0)=1, sinc(x)=sin(πx)/(πx)
+static double sinc_norm(double x)
+{
+    if(x == 0.0) return 1.0;
+    double px = M_PI * x;
+    return sin(px) / px;
+}
+ 
+// Fenêtre de Kaiser : I0(beta * sqrt(1 - (x/a)²)) / I0(beta)
+// Approximation I0 via série de Taylor (suffisante pour beta<=10)
+static double bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0;
+    double x2 = x * x * 0.25;
+    for(int k = 1; k <= 20; k++) {
+        term *= x2 / ((double)(k * k));
+        sum  += term;
+        if(term < 1e-12 * sum) break;
+    }
+    return sum;
+}
+ 
+// kaiser_sinc(x, lobes, beta) :
+//   x     : position en pixels
+//   lobes : nombre de lobes (2 = lanczos-2, ici on utilise 2)
+//   beta  : paramètre kaiser (6..12 typique, 6=doux, 12=agressif)
+static double kaiser_sinc(double x, double lobes, double beta)
+{
+    double ax = fabs(x);
+    if(ax >= lobes) return 0.0;
+    double w = bessel_i0(beta * sqrt(1.0 - (x / lobes) * (x / lobes)))
+             / bessel_i0(beta);
+    return sinc_norm(x) * w;
+}
+ 
+// Précalcule la LUT : pour chaque t dans [0..WEIGHT_MAX],
+// calcule les 4 poids normalisés (en virgule fixe 0..WEIGHT_MAX)
+// correspondant à l'interpolation à la position fractionnaire
+// t / WEIGHT_MAX entre src et src+1.
+//
+// Convention :
+//   k[0] = poids pour src-1   (x = t+1 par rapport à src-1)
+//   k[1] = poids pour src     (x = t)
+//   k[2] = poids pour src+1   (x = t-1)
+//   k[3] = poids pour src+2   (x = t-2)
+//
+// À t=0 : k[]={0,1,0,0} → pixel source pur (dégénère en nearest)
+// À t=1 : k[]={0,0,1,0} → pixel src+1 pur
+//
+// beta=6.0 est un bon défaut pour du contenu vidéo compressé :
+// assez doux pour ne pas amplifier les artefacts DCT.
+void compute_kaiser4_lut(double beta)
+{
+    const double lobes = 2.0;
+    for(int ti = 0; ti <= WEIGHT_MAX; ti++)
+    {
+        double t = (double)ti / (double)WEIGHT_MAX;
+ 
+        // distances de chaque tap source par rapport à la position cible
+        double xs[4] = { t + 1.0, t, t - 1.0, t - 2.0 };
+ 
+        double w[4], sum = 0.0;
+        for(int i = 0; i < 4; i++) {
+            w[i] = kaiser_sinc(xs[i], lobes, beta);
+            sum += w[i];
+        }
+ 
+        // normalisation + virgule fixe
+        int isum = 0;
+        for(int i = 0; i < 4; i++) {
+            kaiser4_lut[ti][i] = (int)(w[i] / sum * (double)WEIGHT_MAX + 0.5);
+            isum += kaiser4_lut[ti][i];
+        }
+ 
+        // correction d'arrondi : ajuster k[1] pour que la somme == WEIGHT_MAX
+        kaiser4_lut[ti][1] += WEIGHT_MAX - isum;
+    }
+}
+
+
 void usage(void)
 {
     fprintf(stderr,
@@ -99,7 +185,10 @@ void usage(void)
         "\t                     1 = blend 50%% on the upper minority of phases\n"
         "\t                     2 = linear weighted blending\n"
         "\t                     3 = exponential weighted blending (uses --curve-base)\n"
+		"\t                     5 = kaiser 4-tap avec poids exponentiels\n"
         "\t--curve-base FLOAT exponential curve base for mode 4 / tmp-mode 3 (default: 2.0, must be > 1.0)\n\n"
+		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.0)\n"
+		"\t                     low = sharp/ringing, high = smooth/no ringing\n"
     );
     exit(1);
 }
@@ -524,7 +613,7 @@ void process_files(const unsigned char * restrict in_buf,
 	const int in_w3    = in_w * 3;
 	const int out_w3   = out_w * 3;
 	const int in_size  = in_w * in_h * 3;
-	const int bilinear = (mode >= 1);
+	const int bilinear = (mode >= 1 && mode != 5);
 	const int weighted = (mode == 3 || mode == 4);
     unsigned int offset = 0;
     for(int r=0; r<ratio; r++)
@@ -554,15 +643,15 @@ void process_files(const unsigned char * restrict in_buf,
 
 		for(int h=0; h<in_h; h++)
 		{
-			const unsigned char * restrict src_row = src_buf + h * in_w3;   // calculé une fois par ligne
-			unsigned char       *dst_row = tmp_buf + h * out_w3;
-
+			const unsigned char * restrict src_row = src_buf + h * in_w3;
+			unsigned char *dst_row = tmp_buf + h * out_w3;
+		 
 			int px3 = 0;
-			for(int px=0; px<out_w; px++, px3+=3)  // px3 remplace px/3
+			for(int px=0; px<out_w; px++, px3+=3)
 			{
 				const int src_px      = map->w_src [map_w_base + px] * 3;
 				const int is_bilinear = map->w_flag[map_w_base + px];
-
+		 
 				if(weighted && is_bilinear == 1 && src_px + 3 < in_w3)
 				{
 					const int w  = map->w_weight[map_w_base + px];
@@ -591,6 +680,44 @@ void process_files(const unsigned char * restrict in_buf,
 					dst_row[px3+1] = (src_row[src_px-2] + src_row[src_px+1]) >> 1;
 					dst_row[px3+2] = (src_row[src_px-1] + src_row[src_px+2]) >> 1;
 				}
+				// ---- MODE 5 : kaiser 4 taps ----
+				else if(mode == 5 && is_bilinear != 0)
+				{
+					const int w = map->w_weight[map_w_base + px];
+					if(w == 0)
+					{
+						dst_row[px3]   = src_row[src_px];
+						dst_row[px3+1] = src_row[src_px+1];
+						dst_row[px3+2] = src_row[src_px+2];
+					}
+					else
+					{
+						const int *k = kaiser4_lut[w];
+						int p1, p2, p3, p4;
+		 
+						if(is_bilinear == 1) {
+							p1 = (src_px >= 3)        ? src_px - 3 : src_px;
+							p2 = src_px;
+							p3 = (src_px + 3 < in_w3) ? src_px + 3 : src_px;
+							p4 = (src_px + 6 < in_w3) ? src_px + 6 : p3;  // ← était src_px + 3
+						} else {
+							p1 = (src_px + 3 < in_w3) ? src_px + 3 : src_px;
+							p2 = src_px;
+							p3 = (src_px >= 3)         ? src_px - 3 : src_px;
+							p4 = (src_px >= 6)         ? src_px - 6 : p3;  // ← était src_px - 3
+						}
+		 
+						int v0 = ((int)src_row[p1]*k[0] + (int)src_row[p2]*k[1]
+								+ (int)src_row[p3]*k[2] + (int)src_row[p4]*k[3]) >> WEIGHT_SHIFT;
+						int v1 = ((int)src_row[p1+1]*k[0] + (int)src_row[p2+1]*k[1]
+								+ (int)src_row[p3+1]*k[2] + (int)src_row[p4+1]*k[3]) >> WEIGHT_SHIFT;
+						int v2 = ((int)src_row[p1+2]*k[0] + (int)src_row[p2+2]*k[1]
+								+ (int)src_row[p3+2]*k[2] + (int)src_row[p4+2]*k[3]) >> WEIGHT_SHIFT;
+						dst_row[px3]   = v0 < 0 ? 0 : v0 > 255 ? 255 : v0;
+						dst_row[px3+1] = v1 < 0 ? 0 : v1 > 255 ? 255 : v1;
+						dst_row[px3+2] = v2 < 0 ? 0 : v2 > 255 ? 255 : v2;
+					}
+				}
 				else
 				{
 					dst_row[px3]   = src_row[src_px];
@@ -607,19 +734,16 @@ void process_files(const unsigned char * restrict in_buf,
 		{
 			const int src_line    = map->h_src [map_h_base + px];
 			const int is_bilinear = map->h_flag[map_h_base + px];
-
+		 
 			unsigned char       *dst_row  = out_buf + offset + px * out_w3;
 			const unsigned char * restrict tmp_row0 = tmp_buf + src_line * out_w3;
-
+		 
 			if(weighted && is_bilinear == 1 && src_line + 1 < in_h)
 			{
 				const int w = map->h_weight[map_h_base + px];
-				if(w == 0)
-				{
+				if(w == 0) {
 					memcpy(dst_row, tmp_row0, out_w3);
-				}
-				else
-				{
+				} else {
 					const int iw = WEIGHT_MAX - w;
 					const unsigned char * restrict tmp_row1 = tmp_row0 + out_w3;
 					for(int i=0; i<out_w3; i++)
@@ -629,12 +753,9 @@ void process_files(const unsigned char * restrict in_buf,
 			else if(weighted && is_bilinear == -1 && src_line >= 1)
 			{
 				const int w = map->h_weight[map_h_base + px];
-				if(w == 0)
-				{
+				if(w == 0) {
 					memcpy(dst_row, tmp_row0, out_w3);
-				}
-				else
-				{
+				} else {
 					const int iw = WEIGHT_MAX - w;
 					const unsigned char * restrict tmp_row_1 = tmp_row0 - out_w3;
 					for(int i=0; i<out_w3; i++)
@@ -645,7 +766,7 @@ void process_files(const unsigned char * restrict in_buf,
 			{
 				const unsigned char * restrict tmp_row1 = tmp_row0 + out_w3;
 				for(int i=0; i<out_w3; i++)
-					dst_row[i] = (tmp_row0[i] + tmp_row1[i]) >> 1;  // ← SIMD-vectorisable
+					dst_row[i] = (tmp_row0[i] + tmp_row1[i]) >> 1;
 			}
 			else if(bilinear && !weighted && is_bilinear == -1 && src_line >= 1)
 			{
@@ -653,9 +774,47 @@ void process_files(const unsigned char * restrict in_buf,
 				for(int i=0; i<out_w3; i++)
 					dst_row[i] = (tmp_row_1[i] + tmp_row0[i]) >> 1;
 			}
+			// ---- MODE 5 : kaiser 4 taps ----
+			else if(mode == 5 && is_bilinear != 0)
+			{
+				const int w = map->h_weight[map_h_base + px];
+				if(w == 0)
+				{
+					memcpy(dst_row, tmp_row0, out_w3);
+				}
+				else
+				{
+					const int *k = kaiser4_lut[w];
+					int l1, l2, l3, l4;
+		 
+					if(is_bilinear == 1) {
+						l1 = (src_line >= 1)       ? src_line - 1 : src_line;
+						l2 = src_line;
+						l3 = (src_line + 1 < in_h) ? src_line + 1 : src_line;
+						l4 = (src_line + 2 < in_h) ? src_line + 2 : l3;  // ← était src_line + 1
+					} else {
+						l1 = (src_line + 1 < in_h) ? src_line + 1 : src_line;
+						l2 = src_line;
+						l3 = (src_line >= 1)        ? src_line - 1 : src_line;
+						l4 = (src_line >= 2)        ? src_line - 2 : l3;  // ← était src_line - 1
+					}
+		 
+					const unsigned char *r1 = tmp_buf + l1 * out_w3;
+					const unsigned char *r2 = tmp_buf + l2 * out_w3;
+					const unsigned char *r3 = tmp_buf + l3 * out_w3;
+					const unsigned char *r4 = tmp_buf + l4 * out_w3;
+		 
+					for(int i = 0; i < out_w3; i++) {
+						int v = ((int)r1[i]*k[0] + (int)r2[i]*k[1]
+							   + (int)r3[i]*k[2] + (int)r4[i]*k[3]) >> WEIGHT_SHIFT;
+						dst_row[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+					}
+				}
+			}
+			// ---- FIN MODE 5 ----
 			else
 			{
-				memcpy(dst_row, tmp_row0, out_w3);  // ← bien plus rapide que pixel par pixel
+				memcpy(dst_row, tmp_row0, out_w3);
 			}
 		}
         offset += out_w*out_h*3;
@@ -714,6 +873,7 @@ int main(int argc, char **argv)
 	int mode = 0;
 	int tmp_mode = 0;         // mode de blending temporel (0 = duplication)
 	double curve_base = 2.0;  // base de la courbe exponentielle (modes 4 / tmp 3)
+	double kaiser_beta = 2.0;  // défaut agressif, netteté maximale
 	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	
 	//buffer : in_buf a 1 slot supplémentaire pour le look-ahead temporel.
@@ -758,6 +918,7 @@ int main(int argc, char **argv)
 		{"mode",       1, 0, 6},
 		{"curve-base", 1, 0, 7},
 		{"tmp-mode",   1, 0, 8},
+		{"kaiser-beta", 1, 0, 9},
 		{0, 0, 0, 0}//reminder : letter value are from 65 to 122
 	};
 
@@ -790,6 +951,9 @@ int main(int argc, char **argv)
 		case 8:
 			tmp_mode = atoi(optarg);
 			break;
+		case 9:
+			kaiser_beta = atof(optarg);
+			break;
 		default:
 			usage();
 			break;
@@ -802,7 +966,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(mode < 0 || mode > 4)
+	if(mode < 0 || mode > 5)
 	{
 		fprintf(stderr, "Error : mode '%d' is not supported\n", mode);
 		return -1;
@@ -822,6 +986,8 @@ int main(int argc, char **argv)
 
 	if(mode == 3 && curve_base != 2.0)
 		fprintf(stderr, "Warning : --curve-base is ignored in mode 3 (linear curve)\n");
+	
+	
 	
 	//reading file
 	if (strcmp(input_name, "-") == 0)// Read samples from stdin
@@ -919,6 +1085,13 @@ int main(int argc, char **argv)
 	else if(mode == 2)
 	{
 		adjust_bilinear_phases(&map, out_w, out_h, frames_ratio);
+	}
+	// --- 4b. init map + LUT (après les blocs mode 2/3/4 existants) ---
+	else if(mode == 5)
+	{
+		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
+		adjust_bilinear_phases_weighted(&map, out_w, out_h, frames_ratio);
+		compute_kaiser4_lut(kaiser_beta);
 	}
 
 	// Pré-calcul des poids temporels (une fois pour toute la vidéo)
