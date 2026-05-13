@@ -63,6 +63,7 @@ struct ThreadArgs
 	unsigned char *tmp_buf;
 	unsigned char *blend_buf;  // résultat du lerp temporel (taille in_w*in_h*3)
 	BresenhamMap *map;
+	BresenhamMap *map_uv;
 	const int *tmp_weights;    // poids temporel par phase (taille = ratio)
 	int mode_1d;
 	int pix_fmt;
@@ -191,12 +192,12 @@ void usage(void)
         "\t                     2 = bilinear with temporal alternation\n"
         "\t                     3 = linear weighted bilinear with temporal alternation\n"
         "\t                     4 = exponential weighted bilinear with temporal alternation\n"
+		"\t                     5 = kaiser 4-tap avec poids exponentiels\n"
         "\t--tmp-mode INT     temporal blending mode (default: 0)\n"
         "\t                     0 = duplicate frames (no blending)\n"
         "\t                     1 = blend 50%% on the upper minority of phases\n"
         "\t                     2 = linear weighted blending\n"
         "\t                     3 = exponential weighted blending (uses --curve-base)\n"
-		"\t                     5 = kaiser 4-tap avec poids exponentiels\n"
         "\t--curve-base FLOAT exponential curve base for mode 4 / tmp-mode 3 (default: 2.0, must be > 1.0)\n\n"
 		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.5)\n"
 		"\t                     low = sharp/ringing, high = smooth/no ringing\n"
@@ -880,11 +881,17 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
             const unsigned char * restrict row3 = src_plane + l3 * in_w;
             const unsigned char * restrict row4 = src_plane + l4 * in_w;
 
-            const int kv0 = kaiser4_lut[wy][0];
-            const int kv1 = kaiser4_lut[wy][1];
-            const int kv2 = kaiser4_lut[wy][2];
-            const int kv3 = kaiser4_lut[wy][3];
-            const int iwy = WEIGHT_MAX - wy;
+            int kv0 = 0, kv1 = 0, kv2 = 0, kv3 = 0;
+			int iwy = 0;
+
+			if(mode5) {
+				kv0 = kaiser4_lut[wy][0];
+				kv1 = kaiser4_lut[wy][1];
+				kv2 = kaiser4_lut[wy][2];
+				kv3 = kaiser4_lut[wy][3];
+			} else if(weighted) {
+				iwy = WEIGHT_MAX - wy;
+			}
 
             if(hl == 0)
             {
@@ -1097,11 +1104,17 @@ void process_files_2d(const unsigned char * restrict in_buf,
             const unsigned char * restrict row4 = src_buf + l4 * in_w3;
 
             // poids verticaux kaiser — constants pour toute la ligne
-            const int kv0 = kaiser4_lut[wy][0];
-            const int kv1 = kaiser4_lut[wy][1];
-            const int kv2 = kaiser4_lut[wy][2];
-            const int kv3 = kaiser4_lut[wy][3];
-            const int iwy = WEIGHT_MAX - wy;
+            int kv0 = 0, kv1 = 0, kv2 = 0, kv3 = 0;
+			int iwy = 0;
+
+			if(mode5) {
+				kv0 = kaiser4_lut[wy][0];
+				kv1 = kaiser4_lut[wy][1];
+				kv2 = kaiser4_lut[wy][2];
+				kv3 = kaiser4_lut[wy][3];
+			} else if(weighted) {
+				iwy = WEIGHT_MAX - wy;
+			}
 
             // --- branche hl hissée hors de la boucle x ---
 
@@ -1564,104 +1577,246 @@ void *worker_loop(void *arg) {
         int cmd = w->ready;
         w->ready = 0;
         pthread_mutex_unlock(&w->mutex);
- 
+
         if (cmd == -1) break;
- 
+
         ThreadArgs *a = &w->args;
- 
-        const int in_plane_size  = a->in_w  * a->in_h;
-        const int out_plane_size = a->out_w * a->out_h * a->ratio;
-        const int tmp_plane_size = a->out_w * a->in_h;
- 
+
+        const int in_y_size   = a->in_w * a->in_h;
+		const int out_y_size  = a->out_w * a->out_h * a->ratio;
+		const int tmp_y_size  = a->out_w * a->in_h;
+
+		const int uv_in_h  = (a->pix_fmt == PIX_420) ? a->in_h  / 2 : a->in_h;
+		const int uv_out_h = (a->pix_fmt == PIX_420) ? a->out_h / 2 : a->out_h;
+
+		const int in_uv_size  = (a->in_w/2)  * uv_in_h;
+		const int out_uv_size = (a->out_w/2) * uv_out_h * a->ratio;
+		const int tmp_uv_size = (a->out_w/2) * uv_in_h;
+
         switch(a->mode_1d) {
-            case 1:
-                // pipeline 1D séparable
-                if(a->pix_fmt == PIX_RGB)
-                {
-                    process_files(a->in_buf, a->next_buf, a->blend_buf,
-                                  a->out_buf, a->tmp_buf,
-                                  a->map, a->tmp_weights,
-                                  a->in_w, a->in_h, a->out_w, a->out_h,
-                                  a->ratio, a->mode);
-                }
-                else // YUV444p
-                {
-                    // Y
-                    process_files_plane(
-                        a->in_buf,
-                        a->next_buf,
-                        a->blend_buf,
-                        a->out_buf,
-                        a->tmp_buf,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
-                    // U
-                    process_files_plane(
-                        a->in_buf   + in_plane_size,
-                        a->next_buf + in_plane_size,
-                        a->blend_buf+ in_plane_size,
-                        a->out_buf  + out_plane_size,
-                        a->tmp_buf  + tmp_plane_size,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
-                    // V
-                    process_files_plane(
-                        a->in_buf   + in_plane_size  * 2,
-                        a->next_buf + in_plane_size  * 2,
-                        a->blend_buf+ in_plane_size  * 2,
-                        a->out_buf  + out_plane_size * 2,
-                        a->tmp_buf  + tmp_plane_size * 2,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
+
+            case 1:  // pipeline 1D séparable
+                switch(a->pix_fmt) {
+                    case PIX_RGB:
+                        process_files(
+                            a->in_buf, a->next_buf, a->blend_buf,
+                            a->out_buf, a->tmp_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+
+                    case PIX_444:
+                        // Y
+                        process_files_plane(
+                            a->in_buf,
+                            a->next_buf,
+                            a->blend_buf,
+                            a->out_buf,
+                            a->tmp_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // U
+                        process_files_plane(
+                            a->in_buf    + in_y_size,
+                            a->next_buf  + in_y_size,
+                            a->blend_buf + in_y_size,
+                            a->out_buf   + out_y_size,
+                            a->tmp_buf   + tmp_y_size,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // V
+                        process_files_plane(
+                            a->in_buf    + in_y_size * 2,
+                            a->next_buf  + in_y_size * 2,
+                            a->blend_buf + in_y_size * 2,
+                            a->out_buf   + out_y_size * 2,
+                            a->tmp_buf   + tmp_y_size * 2,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+
+                    case PIX_422:
+                        // Y
+                        process_files_plane(
+                            a->in_buf,
+                            a->next_buf,
+                            a->blend_buf,
+                            a->out_buf,
+                            a->tmp_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // U
+                        process_files_plane(
+                            a->in_buf    + in_y_size,
+                            a->next_buf  + in_y_size,
+                            a->blend_buf + in_y_size,
+                            a->out_buf   + out_y_size,
+                            a->tmp_buf   + tmp_y_size,
+                            a->map_uv, a->tmp_weights,
+                            a->in_w/2, a->in_h, a->out_w/2, a->out_h,
+                            a->ratio, a->mode);
+                        // V
+                        process_files_plane(
+                            a->in_buf    + in_y_size + in_uv_size,
+                            a->next_buf  + in_y_size + in_uv_size,
+                            a->blend_buf + in_y_size + in_uv_size,
+                            a->out_buf   + out_y_size + out_uv_size,
+                            a->tmp_buf   + tmp_y_size + tmp_uv_size,
+                            a->map_uv, a->tmp_weights,
+                            a->in_w/2, a->in_h, a->out_w/2, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+					
+					case PIX_420:
+						// Y
+						process_files_plane(
+							a->in_buf,
+							a->next_buf,
+							a->blend_buf,
+							a->out_buf,
+							a->tmp_buf,
+							a->map, a->tmp_weights,
+							a->in_w, a->in_h, a->out_w, a->out_h,
+							a->ratio, a->mode);
+						// U
+						process_files_plane(
+							a->in_buf    + in_y_size,
+							a->next_buf  + in_y_size,
+							a->blend_buf + in_y_size,
+							a->out_buf   + out_y_size,
+							a->tmp_buf   + tmp_y_size,
+							a->map_uv, a->tmp_weights,
+							a->in_w/2, a->in_h/2, a->out_w/2, a->out_h/2,
+							a->ratio, a->mode);
+						// V
+						process_files_plane(
+							a->in_buf    + in_y_size + in_uv_size,
+							a->next_buf  + in_y_size + in_uv_size,
+							a->blend_buf + in_y_size + in_uv_size,
+							a->out_buf   + out_y_size + out_uv_size,
+							a->tmp_buf   + tmp_y_size + tmp_uv_size,
+							a->map_uv, a->tmp_weights,
+							a->in_w/2, a->in_h/2, a->out_w/2, a->out_h/2,
+							a->ratio, a->mode);
+						break;
+
+                    default:
+                        break;
                 }
                 break;
- 
-            default:
-                // pipeline 2D direct
-                if(a->pix_fmt == PIX_RGB)
-                {
-                    process_files_2d(a->in_buf, a->next_buf, a->blend_buf,
-                                     a->out_buf, a->tmp_buf,
-                                     a->map, a->tmp_weights,
-                                     a->in_w, a->in_h, a->out_w, a->out_h,
-                                     a->ratio, a->mode);
-                }
-                else // YUV444p
-                {
-                    // Y
-                    process_files_2d_plane(
-                        a->in_buf,
-                        a->next_buf,
-                        a->blend_buf,
-                        a->out_buf,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
-                    // U
-                    process_files_2d_plane(
-                        a->in_buf   + in_plane_size,
-                        a->next_buf + in_plane_size,
-                        a->blend_buf+ in_plane_size,
-                        a->out_buf  + out_plane_size,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
-                    // V
-                    process_files_2d_plane(
-                        a->in_buf   + in_plane_size  * 2,
-                        a->next_buf + in_plane_size  * 2,
-                        a->blend_buf+ in_plane_size  * 2,
-                        a->out_buf  + out_plane_size * 2,
-                        a->map, a->tmp_weights,
-                        a->in_w, a->in_h, a->out_w, a->out_h,
-                        a->ratio, a->mode);
+
+            default:  // pipeline 2D direct
+                switch(a->pix_fmt) {
+                    case PIX_RGB:
+                        process_files_2d(
+                            a->in_buf, a->next_buf, a->blend_buf,
+                            a->out_buf, a->tmp_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+
+                    case PIX_444:
+                        // Y
+                        process_files_2d_plane(
+                            a->in_buf,
+                            a->next_buf,
+                            a->blend_buf,
+                            a->out_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // U
+                        process_files_2d_plane(
+                            a->in_buf    + in_y_size,
+                            a->next_buf  + in_y_size,
+                            a->blend_buf + in_y_size,
+                            a->out_buf   + out_y_size,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // V
+                        process_files_2d_plane(
+                            a->in_buf    + in_y_size * 2,
+                            a->next_buf  + in_y_size * 2,
+                            a->blend_buf + in_y_size * 2,
+                            a->out_buf   + out_y_size * 2,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+
+                    case PIX_422:
+                        // Y
+                        process_files_2d_plane(
+                            a->in_buf,
+                            a->next_buf,
+                            a->blend_buf,
+                            a->out_buf,
+                            a->map, a->tmp_weights,
+                            a->in_w, a->in_h, a->out_w, a->out_h,
+                            a->ratio, a->mode);
+                        // U
+                        process_files_2d_plane(
+                            a->in_buf    + in_y_size,
+                            a->next_buf  + in_y_size,
+                            a->blend_buf + in_y_size,
+                            a->out_buf   + out_y_size,
+                            a->map_uv, a->tmp_weights,
+                            a->in_w/2, a->in_h, a->out_w/2, a->out_h,
+                            a->ratio, a->mode);
+                        // V
+                        process_files_2d_plane(
+                            a->in_buf    + in_y_size + in_uv_size,
+                            a->next_buf  + in_y_size + in_uv_size,
+                            a->blend_buf + in_y_size + in_uv_size,
+                            a->out_buf   + out_y_size + out_uv_size,
+                            a->map_uv, a->tmp_weights,
+                            a->in_w/2, a->in_h, a->out_w/2, a->out_h,
+                            a->ratio, a->mode);
+                        break;
+					
+					case PIX_420:
+					// Y
+					process_files_2d_plane(
+						a->in_buf,
+						a->next_buf,
+						a->blend_buf,
+						a->out_buf,
+						a->map, a->tmp_weights,
+						a->in_w, a->in_h, a->out_w, a->out_h,
+						a->ratio, a->mode);
+					// U
+					process_files_2d_plane(
+						a->in_buf    + in_y_size,
+						a->next_buf  + in_y_size,
+						a->blend_buf + in_y_size,
+						a->out_buf   + out_y_size,
+						a->map_uv, a->tmp_weights,
+						a->in_w/2, a->in_h/2, a->out_w/2, a->out_h/2,
+						a->ratio, a->mode);
+					// V
+					process_files_2d_plane(
+						a->in_buf    + in_y_size + in_uv_size,
+						a->next_buf  + in_y_size + in_uv_size,
+						a->blend_buf + in_y_size + in_uv_size,
+						a->out_buf   + out_y_size + out_uv_size,
+						a->map_uv, a->tmp_weights,
+						a->in_w/2, a->in_h/2, a->out_w/2, a->out_h/2,
+						a->ratio, a->mode);
+					break;					
+
+                    default:
+                        break;
                 }
                 break;
         }
- 
+
         pthread_mutex_lock(&w->mutex);
         w->done = 1;
         pthread_cond_signal(&w->cond_done);
@@ -1736,6 +1891,18 @@ int main(int argc, char **argv)
 	map.w_length = 0;
 	map.h_length = 0;
 	
+	BresenhamMap map_uv;
+	map_uv.w_src    = NULL;
+	map_uv.w_flag   = NULL;
+	map_uv.w_weight = NULL;
+	map_uv.w_heavy  = NULL;
+	map_uv.h_src    = NULL;
+	map_uv.h_flag   = NULL;
+	map_uv.h_weight = NULL;
+	map_uv.h_heavy  = NULL;
+	map_uv.w_length = 0;
+	map_uv.h_length = 0;
+	
 	int option_index = 0;
 	static struct option long_options[] = {
 		{"in-width",   1, 0, 1},
@@ -1800,12 +1967,6 @@ int main(int argc, char **argv)
 		}
 	}
 	
-	if(pix_fmt == PIX_422 || pix_fmt == PIX_420)
-	{
-		fprintf(stderr, "Error: pix-fmt '%s' not yet implemented\n", optarg);
-		return -1;
-	}
-	
 	if(input_name == NULL)
 	{
 		fprintf(stderr, "no input file provided\n");
@@ -1857,7 +2018,12 @@ int main(int argc, char **argv)
 			case PIX_422: in_buf_length = in_w * in_h * 2; break;
 			case PIX_420: in_buf_length = in_w * in_h * 3 / 2; break;
 		}
-		out_buf_length = out_w * out_h * 3 * frames_ratio;
+		switch(pix_fmt) {
+			case PIX_RGB:
+			case PIX_444: out_buf_length = out_w * out_h * 3     * frames_ratio; break;
+			case PIX_422: out_buf_length = out_w * out_h * 2     * frames_ratio; break;
+			case PIX_420: out_buf_length = out_w * out_h * 3 / 2 * frames_ratio; break;
+		}
 		
 		map.w_length = out_w * frames_ratio;
 		map.h_length = out_h * frames_ratio;
@@ -1871,12 +2037,52 @@ int main(int argc, char **argv)
 		map.h_weight = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		map.h_heavy  = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		
+		if(pix_fmt == PIX_422 || pix_fmt == PIX_420)
+		{
+			const int uv_in_w  = in_w  / 2;
+			const int uv_in_h  = (pix_fmt == PIX_420) ? in_h  / 2 : in_h;
+			const int uv_out_w = out_w / 2;
+			const int uv_out_h = (pix_fmt == PIX_420) ? out_h / 2 : out_h;
+
+			map_uv.w_length = uv_out_w * frames_ratio;
+			map_uv.h_length = uv_out_h * frames_ratio;
+
+			map_uv.w_src    = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
+			map_uv.w_flag   = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
+			map_uv.w_weight = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
+			map_uv.w_heavy  = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
+			map_uv.h_src    = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
+			map_uv.h_flag   = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
+			map_uv.h_weight = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
+			map_uv.h_heavy  = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
+
+			if(!map_uv.w_src || !map_uv.w_flag || !map_uv.w_weight || !map_uv.w_heavy ||
+			   !map_uv.h_src || !map_uv.h_flag || !map_uv.h_weight || !map_uv.h_heavy)
+			{
+				ALIGNED_FREE(map_uv.w_src);
+				ALIGNED_FREE(map_uv.w_flag);
+				ALIGNED_FREE(map_uv.w_weight);
+				ALIGNED_FREE(map_uv.w_heavy);
+				ALIGNED_FREE(map_uv.h_src);
+				ALIGNED_FREE(map_uv.h_flag);
+				ALIGNED_FREE(map_uv.h_weight);
+				ALIGNED_FREE(map_uv.h_heavy);
+				fprintf(stderr, "ALIGNED_MALLOC error (map_uv)\n");
+				return -1;
+			}
+		}
+		
 		int alloc_err = 0;
 		for(int t=0; t<NB_THREADS; t++)
 		{
 			in_buf[t]    = ALIGNED_MALLOC(in_buf_length, 64);
 			out_buf[t]   = ALIGNED_MALLOC(out_buf_length, 64);
-			tmp_buf[t]   = ALIGNED_MALLOC(out_w * in_h * 3, 64);
+			switch(pix_fmt) {
+				case PIX_RGB:
+				case PIX_444: tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3,     64); break;
+				case PIX_422: tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 2,     64); break;
+				case PIX_420: tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3 / 2, 64); break;
+			}
 			blend_buf[t] = ALIGNED_MALLOC(in_buf_length, 64);
 			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL || blend_buf[t] == NULL)
 				alloc_err = 1;
@@ -1944,6 +2150,31 @@ int main(int argc, char **argv)
 		adjust_bilinear_phases_weighted(&map, out_w, out_h, frames_ratio);
 		compute_kaiser4_lut(kaiser_beta);
 	}
+	
+	if(pix_fmt == PIX_422 || pix_fmt == PIX_420)
+	{
+		const int uv_in_w  = in_w  / 2;
+		const int uv_in_h  = (pix_fmt == PIX_420) ? in_h  / 2 : in_h;
+		const int uv_out_w = out_w / 2;
+		const int uv_out_h = (pix_fmt == PIX_420) ? out_h / 2 : out_h;
+	 
+		compute_scale_map(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
+	 
+		if(mode == 3)
+		{
+			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_LINEAR, curve_base);
+			adjust_bilinear_phases_weighted(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+		}
+		else if(mode == 4 || mode == 5)
+		{
+			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
+			adjust_bilinear_phases_weighted(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+		}
+		else if(mode == 2)
+		{
+			adjust_bilinear_phases(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+		}
+	}
 
 	// Pré-calcul des poids temporels (une fois pour toute la vidéo)
 	compute_temporal_weights(tmp_weights, frames_ratio, (TmpMode)tmp_mode, curve_base);
@@ -1961,6 +2192,7 @@ int main(int argc, char **argv)
 		args[t].mode        = mode;
 		args[t].mode_1d     = mode_1d;
 		args[t].pix_fmt     = pix_fmt;
+		args[t].map_uv = (pix_fmt == PIX_422 || pix_fmt == PIX_420) ? &map_uv : NULL;
 	}
 	
 	// --- init thread pool ---
@@ -2038,6 +2270,34 @@ int main(int argc, char **argv)
 				{
 					fwrite(out_buf[t], out_buf_length, 1, stdout);
 				}
+				else if(pix_fmt == PIX_422)
+				{
+					const int frame_y_size  = out_w     * out_h;
+					const int frame_uv_size = (out_w/2) * out_h;
+					const int out_y_plane   = frame_y_size  * frames_ratio;
+					const int out_uv_plane  = frame_uv_size * frames_ratio;
+				 
+					for(int f = 0; f < frames_ratio; f++)
+					{
+						fwrite(out_buf[t] + f * frame_y_size,                    frame_y_size,  1, stdout); // Y
+						fwrite(out_buf[t] + out_y_plane  + f * frame_uv_size,    frame_uv_size, 1, stdout); // U
+						fwrite(out_buf[t] + out_y_plane + out_uv_plane + f * frame_uv_size, frame_uv_size, 1, stdout); // V
+					}
+				}
+				else if(pix_fmt == PIX_420)
+				{
+					const int frame_y_size  = out_w     * out_h;
+					const int frame_uv_size = (out_w/2) * (out_h/2);  // ← /2 sur h aussi
+					const int out_y_plane   = frame_y_size  * frames_ratio;
+					const int out_uv_plane  = frame_uv_size * frames_ratio;
+
+					for(int f = 0; f < frames_ratio; f++)
+					{
+						fwrite(out_buf[t] + f * frame_y_size,                               frame_y_size,  1, stdout);
+						fwrite(out_buf[t] + out_y_plane + f * frame_uv_size,                frame_uv_size, 1, stdout);
+						fwrite(out_buf[t] + out_y_plane + out_uv_plane + f * frame_uv_size, frame_uv_size, 1, stdout);
+					}
+				}
 				else // YUV444p
 				{
 					const int frame_size     = out_w * out_h;
@@ -2090,6 +2350,20 @@ int main(int argc, char **argv)
 	ALIGNED_FREE(map.h_weight);
 	ALIGNED_FREE(map.h_heavy);
 	ALIGNED_FREE(tmp_weights);
+	
+	if(pix_fmt == PIX_422 || pix_fmt == PIX_420)
+	{
+		ALIGNED_FREE(map_uv.w_src);
+		ALIGNED_FREE(map_uv.w_flag);
+		ALIGNED_FREE(map_uv.w_weight);
+		ALIGNED_FREE(map_uv.w_heavy);
+		ALIGNED_FREE(map_uv.h_src);
+		ALIGNED_FREE(map_uv.h_flag);
+		ALIGNED_FREE(map_uv.h_weight);
+		ALIGNED_FREE(map_uv.h_heavy);
+	}
+
+	
 	for(int t=0; t<NB_THREADS; t++)
 	{
 		ALIGNED_FREE(in_buf[t]);
