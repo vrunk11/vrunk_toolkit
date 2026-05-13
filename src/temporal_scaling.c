@@ -63,6 +63,7 @@ struct ThreadArgs
 	unsigned char *blend_buf;  // résultat du lerp temporel (taille in_w*in_h*3)
 	BresenhamMap *map;
 	const int *tmp_weights;    // poids temporel par phase (taille = ratio)
+	int mode_1d;
 	int in_w, in_h, out_w, out_h, ratio, mode;
 };
 
@@ -189,6 +190,7 @@ void usage(void)
         "\t--curve-base FLOAT exponential curve base for mode 4 / tmp-mode 3 (default: 2.0, must be > 1.0)\n\n"
 		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.0)\n"
 		"\t                     low = sharp/ringing, high = smooth/no ringing\n"
+		"\t--1d               use separable 1D pipeline (default: 2D)\n"
     );
     exit(1);
 }
@@ -601,6 +603,233 @@ void compute_curve_weights(BresenhamMap *map, int out_w, int out_h, int ratio,
     }
 }
 
+// Helper : interpolation horizontale d'un pixel depuis une ligne source.
+// Retourne le résultat RGB dans out[3].
+static inline void h_interp(const unsigned char *row, int sx3, int wl, int wx,
+                             int in_w3, int weighted, int mode5, int out[3])
+{
+    if(wl == 0)
+    {
+        out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
+        return;
+    }
+
+    if(mode5)
+    {
+        const int *k = kaiser4_lut[wx];
+        int p1, p2, p3, p4;
+        if(wl == 1) {
+            p1 = (sx3 >= 3)        ? sx3 - 3 : sx3;
+            p2 = sx3;
+            p3 = (sx3 + 3 < in_w3) ? sx3 + 3 : sx3;
+            p4 = (sx3 + 6 < in_w3) ? sx3 + 6 : p3;
+        } else {
+            p1 = (sx3 + 3 < in_w3) ? sx3 + 3 : sx3;
+            p2 = sx3;
+            p3 = (sx3 >= 3)         ? sx3 - 3 : sx3;
+            p4 = (sx3 >= 6)         ? sx3 - 6 : p3;
+        }
+        for(int c = 0; c < 3; c++) {
+            int v = ((int)row[p1+c]*k[0] + (int)row[p2+c]*k[1]
+                   + (int)row[p3+c]*k[2] + (int)row[p4+c]*k[3]) >> WEIGHT_SHIFT;
+            out[c] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+        return;
+    }
+
+    if(weighted)
+    {
+        const int iw = WEIGHT_MAX - wx;
+        if(wl == 1 && sx3 + 3 < in_w3) {
+            out[0] = ((int)row[sx3]  *iw + (int)row[sx3+3]*wx) >> WEIGHT_SHIFT;
+            out[1] = ((int)row[sx3+1]*iw + (int)row[sx3+4]*wx) >> WEIGHT_SHIFT;
+            out[2] = ((int)row[sx3+2]*iw + (int)row[sx3+5]*wx) >> WEIGHT_SHIFT;
+        } else if(wl == -1 && sx3 >= 3) {
+            out[0] = ((int)row[sx3]  *iw + (int)row[sx3-3]*wx) >> WEIGHT_SHIFT;
+            out[1] = ((int)row[sx3+1]*iw + (int)row[sx3-2]*wx) >> WEIGHT_SHIFT;
+            out[2] = ((int)row[sx3+2]*iw + (int)row[sx3-1]*wx) >> WEIGHT_SHIFT;
+        } else {
+            out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
+        }
+        return;
+    }
+
+    // bilinear 50/50 (modes 1/2)
+    if(wl == 1 && sx3 + 3 < in_w3) {
+        out[0] = (row[sx3]   + row[sx3+3]) >> 1;
+        out[1] = (row[sx3+1] + row[sx3+4]) >> 1;
+        out[2] = (row[sx3+2] + row[sx3+5]) >> 1;
+    } else if(wl == -1 && sx3 >= 3) {
+        out[0] = (row[sx3-3] + row[sx3])   >> 1;
+        out[1] = (row[sx3-2] + row[sx3+1]) >> 1;
+        out[2] = (row[sx3-1] + row[sx3+2]) >> 1;
+    } else {
+        out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
+    }
+}
+
+void process_files_2d(const unsigned char * restrict in_buf,
+                      const unsigned char * restrict next_buf,
+                      unsigned char * restrict blend_buf,
+                      unsigned char * restrict out_buf,
+                      unsigned char * restrict tmp_buf,  // non utilisé, gardé pour compatibilité
+                      const BresenhamMap * restrict map,
+                      const int *tmp_weights,
+                      const int in_w, const int in_h,
+                      const int out_w, const int out_h,
+                      const int ratio, const int mode)
+{
+    const int in_w3    = in_w * 3;
+    const int out_w3   = out_w * 3;
+    const int in_size  = in_w * in_h * 3;
+    const int weighted = (mode == 3 || mode == 4 || mode == 5);
+    const int mode5    = (mode == 5);
+
+    unsigned int offset = 0;
+    for(int r = 0; r < ratio; r++)
+    {
+        // blend temporel — identique à process_files
+        const int tw = tmp_weights[r];
+        const unsigned char *src_buf;
+        if(tw > 0 && next_buf != in_buf)
+        {
+            const int itw = WEIGHT_MAX - tw;
+            for(int i = 0; i < in_size; i++)
+                blend_buf[i] = (in_buf[i] * itw + next_buf[i] * tw) >> WEIGHT_SHIFT;
+            src_buf = blend_buf;
+        }
+        else
+        {
+            src_buf = in_buf;
+        }
+
+        const int map_w_base = r * out_w;
+        const int map_h_base = r * out_h;
+
+        for(int y = 0; y < out_h; y++)
+        {
+            const int sy = map->h_src   [map_h_base + y];
+            const int hl = map->h_flag  [map_h_base + y];
+            const int wy = map->h_weight[map_h_base + y];
+
+            unsigned char *dst_row = out_buf + offset + y * out_w3;
+
+            // pré-calcul des indices de lignes source pour l'axe vertical
+            int l1, l2, l3, l4;
+            if(hl == 1) {
+                l1 = (sy >= 1)       ? sy - 1 : sy;
+                l2 = sy;
+                l3 = (sy + 1 < in_h) ? sy + 1 : sy;
+                l4 = (sy + 2 < in_h) ? sy + 2 : l3;
+            } else if(hl == -1) {
+                l1 = (sy + 1 < in_h) ? sy + 1 : sy;
+                l2 = sy;
+                l3 = (sy >= 1)        ? sy - 1 : sy;
+                l4 = (sy >= 2)        ? sy - 2 : l3;
+            } else {
+                l1 = l2 = l3 = l4 = sy;  // hl==0, pas d'interpolation verticale
+            }
+
+            const unsigned char *row1 = src_buf + l1 * in_w3;
+            const unsigned char *row2 = src_buf + l2 * in_w3;
+            const unsigned char *row3 = src_buf + l3 * in_w3;
+            const unsigned char *row4 = src_buf + l4 * in_w3;
+
+            int x3 = 0;
+            for(int x = 0; x < out_w; x++, x3 += 3)
+            {
+                const int sx  = map->w_src   [map_w_base + x];
+                const int wl  = map->w_flag  [map_w_base + x];
+                const int wx  = map->w_weight[map_w_base + x];
+                const int sx3 = sx * 3;
+
+                // cas 1 : ancre pure — pixel source pur
+                if(wl == 0 && hl == 0)
+                {
+                    dst_row[x3]   = row2[sx3];
+                    dst_row[x3+1] = row2[sx3+1];
+                    dst_row[x3+2] = row2[sx3+2];
+                }
+                // cas 2 : interpolation horizontale seulement
+                else if(hl == 0)
+                {
+                    int v[3];
+                    h_interp(row2, sx3, wl, wx, in_w3, weighted, mode5, v);
+                    dst_row[x3]   = v[0];
+                    dst_row[x3+1] = v[1];
+                    dst_row[x3+2] = v[2];
+                }
+                // cas 3 : interpolation verticale seulement
+                else if(wl == 0)
+                {
+                    if(mode5)
+                    {
+                        const int *k = kaiser4_lut[wy];
+                        for(int c = 0; c < 3; c++) {
+                            int v = ((int)row1[sx3+c]*k[0] + (int)row2[sx3+c]*k[1]
+                                   + (int)row3[sx3+c]*k[2] + (int)row4[sx3+c]*k[3]) >> WEIGHT_SHIFT;
+                            dst_row[x3+c] = v < 0 ? 0 : v > 255 ? 255 : v;
+                        }
+                    }
+                    else if(weighted)
+                    {
+                        const int iw = WEIGHT_MAX - wy;
+                        // row2 = ligne source, row3 = voisin selon direction hl
+                        for(int c = 0; c < 3; c++)
+                            dst_row[x3+c] = ((int)row2[sx3+c]*iw + (int)row3[sx3+c]*wy) >> WEIGHT_SHIFT;
+                    }
+                    else
+                    {
+                        // bilinear 50/50
+                        for(int c = 0; c < 3; c++)
+                            dst_row[x3+c] = (row2[sx3+c] + row3[sx3+c]) >> 1;
+                    }
+                }
+                // cas 4 : interpolation 2D
+                else
+                {
+                    if(mode5)
+                    {
+                        // 4 interpolations horizontales kaiser, une par ligne verticale
+                        int h1[3], h2[3], h3[3], h4[3];
+                        h_interp(row1, sx3, wl, wx, in_w3, weighted, mode5, h1);
+                        h_interp(row2, sx3, wl, wx, in_w3, weighted, mode5, h2);
+                        h_interp(row3, sx3, wl, wx, in_w3, weighted, mode5, h3);
+                        h_interp(row4, sx3, wl, wx, in_w3, weighted, mode5, h4);
+
+                        // combinaison verticale kaiser
+                        const int *k = kaiser4_lut[wy];
+                        for(int c = 0; c < 3; c++) {
+                            int v = (h1[c]*k[0] + h2[c]*k[1]
+                                   + h3[c]*k[2] + h4[c]*k[3]) >> WEIGHT_SHIFT;
+                            dst_row[x3+c] = v < 0 ? 0 : v > 255 ? 255 : v;
+                        }
+                    }
+                    else if(weighted)
+                    {
+                        int h2[3], h3[3];
+                        h_interp(row2, sx3, wl, wx, in_w3, weighted, 0, h2);
+                        h_interp(row3, sx3, wl, wx, in_w3, weighted, 0, h3);
+                        const int iw = WEIGHT_MAX - wy;
+                        for(int c = 0; c < 3; c++)
+                            dst_row[x3+c] = (h2[c]*iw + h3[c]*wy) >> WEIGHT_SHIFT;
+                    }
+                    else
+                    {
+                        // bilinear 50/50 2D
+                        int h2[3], h3[3];
+                        h_interp(row2, sx3, wl, wx, in_w3, 0, 0, h2);
+                        h_interp(row3, sx3, wl, wx, in_w3, 0, 0, h3);
+                        for(int c = 0; c < 3; c++)
+                            dst_row[x3+c] = (h2[c] + h3[c]) >> 1;
+                    }
+                }
+            }
+        }
+        offset += out_w * out_h * 3;
+    }
+}
+
 void process_files(const unsigned char * restrict in_buf,
                    const unsigned char * restrict next_buf,
                    unsigned char * restrict blend_buf,
@@ -834,9 +1063,18 @@ void *worker_loop(void *arg) {
         if (cmd == -1) break;
 
         ThreadArgs *a = &w->args;
-        process_files(a->in_buf, a->next_buf, a->blend_buf, a->out_buf, a->tmp_buf,
-                      a->map, a->tmp_weights,
-                      a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
+		switch(a->mode_1d) {
+            case 1:
+                process_files(a->in_buf, a->next_buf, a->blend_buf, a->out_buf, a->tmp_buf,
+                              a->map, a->tmp_weights,
+                              a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
+                break;
+            default:
+                process_files_2d(a->in_buf, a->next_buf, a->blend_buf, a->out_buf, a->tmp_buf,
+                                 a->map, a->tmp_weights,
+                                 a->in_w, a->in_h, a->out_w, a->out_h, a->ratio, a->mode);
+                break;
+        }
 
         pthread_mutex_lock(&w->mutex);
         w->done = 1;
@@ -874,6 +1112,7 @@ int main(int argc, char **argv)
 	int tmp_mode = 0;         // mode de blending temporel (0 = duplication)
 	double curve_base = 2.0;  // base de la courbe exponentielle (modes 4 / tmp 3)
 	double kaiser_beta = 2.0;  // défaut agressif, netteté maximale
+	int mode_1d = 0;  // défaut : 2D direct
 	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	
 	//buffer : in_buf a 1 slot supplémentaire pour le look-ahead temporel.
@@ -919,6 +1158,7 @@ int main(int argc, char **argv)
 		{"curve-base", 1, 0, 7},
 		{"tmp-mode",   1, 0, 8},
 		{"kaiser-beta", 1, 0, 9},
+		{"1d", 0, 0, 10},
 		{0, 0, 0, 0}//reminder : letter value are from 65 to 122
 	};
 
@@ -953,6 +1193,9 @@ int main(int argc, char **argv)
 			break;
 		case 9:
 			kaiser_beta = atof(optarg);
+			break;
+		case 10:
+			mode_1d = 1;
 			break;
 		default:
 			usage();
