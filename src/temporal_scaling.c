@@ -603,76 +603,18 @@ void compute_curve_weights(BresenhamMap *map, int out_w, int out_h, int ratio,
     }
 }
 
-// Helper : interpolation horizontale d'un pixel depuis une ligne source.
-// Retourne le résultat RGB dans out[3].
-static inline void h_interp(const unsigned char *row, int sx3, int wl, int wx,
-                             int in_w3, int weighted, int mode5, int out[3])
-{
-    if(wl == 0)
-    {
-        out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
-        return;
-    }
+// ============================================================
+// process_files_2d — version optimisée
+// ============================================================
 
-    if(mode5)
-    {
-        const int *k = kaiser4_lut[wx];
-        int p1, p2, p3, p4;
-        if(wl == 1) {
-            p1 = (sx3 >= 3)        ? sx3 - 3 : sx3;
-            p2 = sx3;
-            p3 = (sx3 + 3 < in_w3) ? sx3 + 3 : sx3;
-            p4 = (sx3 + 6 < in_w3) ? sx3 + 6 : p3;
-        } else {
-            p1 = (sx3 + 3 < in_w3) ? sx3 + 3 : sx3;
-            p2 = sx3;
-            p3 = (sx3 >= 3)         ? sx3 - 3 : sx3;
-            p4 = (sx3 >= 6)         ? sx3 - 6 : p3;
-        }
-        for(int c = 0; c < 3; c++) {
-            int v = ((int)row[p1+c]*k[0] + (int)row[p2+c]*k[1]
-                   + (int)row[p3+c]*k[2] + (int)row[p4+c]*k[3]) >> WEIGHT_SHIFT;
-            out[c] = v < 0 ? 0 : v > 255 ? 255 : v;
-        }
-        return;
-    }
-
-    if(weighted)
-    {
-        const int iw = WEIGHT_MAX - wx;
-        if(wl == 1 && sx3 + 3 < in_w3) {
-            out[0] = ((int)row[sx3]  *iw + (int)row[sx3+3]*wx) >> WEIGHT_SHIFT;
-            out[1] = ((int)row[sx3+1]*iw + (int)row[sx3+4]*wx) >> WEIGHT_SHIFT;
-            out[2] = ((int)row[sx3+2]*iw + (int)row[sx3+5]*wx) >> WEIGHT_SHIFT;
-        } else if(wl == -1 && sx3 >= 3) {
-            out[0] = ((int)row[sx3]  *iw + (int)row[sx3-3]*wx) >> WEIGHT_SHIFT;
-            out[1] = ((int)row[sx3+1]*iw + (int)row[sx3-2]*wx) >> WEIGHT_SHIFT;
-            out[2] = ((int)row[sx3+2]*iw + (int)row[sx3-1]*wx) >> WEIGHT_SHIFT;
-        } else {
-            out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
-        }
-        return;
-    }
-
-    // bilinear 50/50 (modes 1/2)
-    if(wl == 1 && sx3 + 3 < in_w3) {
-        out[0] = (row[sx3]   + row[sx3+3]) >> 1;
-        out[1] = (row[sx3+1] + row[sx3+4]) >> 1;
-        out[2] = (row[sx3+2] + row[sx3+5]) >> 1;
-    } else if(wl == -1 && sx3 >= 3) {
-        out[0] = (row[sx3-3] + row[sx3])   >> 1;
-        out[1] = (row[sx3-2] + row[sx3+1]) >> 1;
-        out[2] = (row[sx3-1] + row[sx3+2]) >> 1;
-    } else {
-        out[0] = row[sx3]; out[1] = row[sx3+1]; out[2] = row[sx3+2];
-    }
-}
+// Macro clamp 0-255 sans branche (cmov-friendly)
+#define CLAMP255(v) ((v) < 0 ? 0 : (v) > 255 ? 255 : (v))
 
 void process_files_2d(const unsigned char * restrict in_buf,
                       const unsigned char * restrict next_buf,
                       unsigned char * restrict blend_buf,
                       unsigned char * restrict out_buf,
-                      unsigned char * restrict tmp_buf,  // non utilisé, gardé pour compatibilité
+                      unsigned char * restrict tmp_buf,
                       const BresenhamMap * restrict map,
                       const int *tmp_weights,
                       const int in_w, const int in_h,
@@ -688,7 +630,6 @@ void process_files_2d(const unsigned char * restrict in_buf,
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
     {
-        // blend temporel — identique à process_files
         const int tw = tmp_weights[r];
         const unsigned char *src_buf;
         if(tw > 0 && next_buf != in_buf)
@@ -712,116 +653,254 @@ void process_files_2d(const unsigned char * restrict in_buf,
             const int hl = map->h_flag  [map_h_base + y];
             const int wy = map->h_weight[map_h_base + y];
 
-            unsigned char *dst_row = out_buf + offset + y * out_w3;
+            unsigned char * restrict dst_row = out_buf + offset + y * out_w3;
 
-            // pré-calcul des indices de lignes source pour l'axe vertical
+            // lignes verticales — constantes pour toute la ligne output y
             int l1, l2, l3, l4;
             if(hl == 1) {
-                l1 = (sy >= 1)       ? sy - 1 : sy;
+                l1 = __builtin_expect(sy >= 1,       1) ? sy - 1 : sy;
                 l2 = sy;
-                l3 = (sy + 1 < in_h) ? sy + 1 : sy;
-                l4 = (sy + 2 < in_h) ? sy + 2 : l3;
+                l3 = __builtin_expect(sy + 1 < in_h, 1) ? sy + 1 : sy;
+                l4 = __builtin_expect(sy + 2 < in_h, 1) ? sy + 2 : l3;
             } else if(hl == -1) {
-                l1 = (sy + 1 < in_h) ? sy + 1 : sy;
+                l1 = __builtin_expect(sy + 1 < in_h, 1) ? sy + 1 : sy;
                 l2 = sy;
-                l3 = (sy >= 1)        ? sy - 1 : sy;
-                l4 = (sy >= 2)        ? sy - 2 : l3;
+                l3 = __builtin_expect(sy >= 1,       1) ? sy - 1 : sy;
+                l4 = __builtin_expect(sy >= 2,       1) ? sy - 2 : l3;
             } else {
-                l1 = l2 = l3 = l4 = sy;  // hl==0, pas d'interpolation verticale
+                l1 = l2 = l3 = l4 = sy;
             }
 
-            const unsigned char *row1 = src_buf + l1 * in_w3;
-            const unsigned char *row2 = src_buf + l2 * in_w3;
-            const unsigned char *row3 = src_buf + l3 * in_w3;
-            const unsigned char *row4 = src_buf + l4 * in_w3;
+            const unsigned char * restrict row1 = src_buf + l1 * in_w3;
+            const unsigned char * restrict row2 = src_buf + l2 * in_w3;
+            const unsigned char * restrict row3 = src_buf + l3 * in_w3;
+            const unsigned char * restrict row4 = src_buf + l4 * in_w3;
 
-            int x3 = 0;
-            for(int x = 0; x < out_w; x++, x3 += 3)
+            // poids verticaux kaiser — constants pour toute la ligne
+            const int kv0 = kaiser4_lut[wy][0];
+            const int kv1 = kaiser4_lut[wy][1];
+            const int kv2 = kaiser4_lut[wy][2];
+            const int kv3 = kaiser4_lut[wy][3];
+            const int iwy = WEIGHT_MAX - wy;
+
+            // --- branche hl hissée hors de la boucle x ---
+
+            if(hl == 0)
             {
-                const int sx  = map->w_src   [map_w_base + x];
-                const int wl  = map->w_flag  [map_w_base + x];
-                const int wx  = map->w_weight[map_w_base + x];
-                const int sx3 = sx * 3;
+                // pas d'interpolation verticale
+                int x3 = 0;
+                for(int x = 0; x < out_w; x++, x3 += 3)
+                {
+                    const int sx  = map->w_src   [map_w_base + x];
+                    const int wl  = map->w_flag  [map_w_base + x];
+                    const int wx  = map->w_weight[map_w_base + x];
+                    const int sx3 = sx * 3;
 
-                // cas 1 : ancre pure — pixel source pur
-                if(wl == 0 && hl == 0)
-                {
-                    dst_row[x3]   = row2[sx3];
-                    dst_row[x3+1] = row2[sx3+1];
-                    dst_row[x3+2] = row2[sx3+2];
-                }
-                // cas 2 : interpolation horizontale seulement
-                else if(hl == 0)
-                {
-                    int v[3];
-                    h_interp(row2, sx3, wl, wx, in_w3, weighted, mode5, v);
-                    dst_row[x3]   = v[0];
-                    dst_row[x3+1] = v[1];
-                    dst_row[x3+2] = v[2];
-                }
-                // cas 3 : interpolation verticale seulement
-                else if(wl == 0)
-                {
-                    if(mode5)
+                    if(wl == 0)
                     {
-                        const int *k = kaiser4_lut[wy];
-                        for(int c = 0; c < 3; c++) {
-                            int v = ((int)row1[sx3+c]*k[0] + (int)row2[sx3+c]*k[1]
-                                   + (int)row3[sx3+c]*k[2] + (int)row4[sx3+c]*k[3]) >> WEIGHT_SHIFT;
-                            dst_row[x3+c] = v < 0 ? 0 : v > 255 ? 255 : v;
+                        dst_row[x3]   = row2[sx3];
+                        dst_row[x3+1] = row2[sx3+1];
+                        dst_row[x3+2] = row2[sx3+2];
+                    }
+                    else if(mode5)
+                    {
+                        const int kh0 = kaiser4_lut[wx][0];
+                        const int kh1 = kaiser4_lut[wx][1];
+                        const int kh2 = kaiser4_lut[wx][2];
+                        const int kh3 = kaiser4_lut[wx][3];
+                        int p1, p2, p3, p4;
+                        if(wl == 1) {
+                            p1 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
+                            p2 = sx3;
+                            p3 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
+                            p4 = __builtin_expect(sx3 + 6 < in_w3, 1) ? sx3 + 6 : p3;
+                        } else {
+                            p1 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
+                            p2 = sx3;
+                            p3 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
+                            p4 = __builtin_expect(sx3 >= 6,        1) ? sx3 - 6 : p3;
                         }
+                        int v0 = ((int)row2[p1]  *kh0 + (int)row2[p2]  *kh1
+                                + (int)row2[p3]  *kh2 + (int)row2[p4]  *kh3) >> WEIGHT_SHIFT;
+                        int v1 = ((int)row2[p1+1]*kh0 + (int)row2[p2+1]*kh1
+                                + (int)row2[p3+1]*kh2 + (int)row2[p4+1]*kh3) >> WEIGHT_SHIFT;
+                        int v2 = ((int)row2[p1+2]*kh0 + (int)row2[p2+2]*kh1
+                                + (int)row2[p3+2]*kh2 + (int)row2[p4+2]*kh3) >> WEIGHT_SHIFT;
+                        dst_row[x3]   = CLAMP255(v0);
+                        dst_row[x3+1] = CLAMP255(v1);
+                        dst_row[x3+2] = CLAMP255(v2);
                     }
                     else if(weighted)
                     {
-                        const int iw = WEIGHT_MAX - wy;
-                        // row2 = ligne source, row3 = voisin selon direction hl
-                        for(int c = 0; c < 3; c++)
-                            dst_row[x3+c] = ((int)row2[sx3+c]*iw + (int)row3[sx3+c]*wy) >> WEIGHT_SHIFT;
-                    }
-                    else
-                    {
-                        // bilinear 50/50
-                        for(int c = 0; c < 3; c++)
-                            dst_row[x3+c] = (row2[sx3+c] + row3[sx3+c]) >> 1;
-                    }
-                }
-                // cas 4 : interpolation 2D
-                else
-                {
-                    if(mode5)
-                    {
-                        // 4 interpolations horizontales kaiser, une par ligne verticale
-                        int h1[3], h2[3], h3[3], h4[3];
-                        h_interp(row1, sx3, wl, wx, in_w3, weighted, mode5, h1);
-                        h_interp(row2, sx3, wl, wx, in_w3, weighted, mode5, h2);
-                        h_interp(row3, sx3, wl, wx, in_w3, weighted, mode5, h3);
-                        h_interp(row4, sx3, wl, wx, in_w3, weighted, mode5, h4);
-
-                        // combinaison verticale kaiser
-                        const int *k = kaiser4_lut[wy];
-                        for(int c = 0; c < 3; c++) {
-                            int v = (h1[c]*k[0] + h2[c]*k[1]
-                                   + h3[c]*k[2] + h4[c]*k[3]) >> WEIGHT_SHIFT;
-                            dst_row[x3+c] = v < 0 ? 0 : v > 255 ? 255 : v;
+                        const int iw = WEIGHT_MAX - wx;
+                        if(wl == 1 && __builtin_expect(sx3 + 3 < in_w3, 1)) {
+                            dst_row[x3]   = ((int)row2[sx3]  *iw + (int)row2[sx3+3]*wx) >> WEIGHT_SHIFT;
+                            dst_row[x3+1] = ((int)row2[sx3+1]*iw + (int)row2[sx3+4]*wx) >> WEIGHT_SHIFT;
+                            dst_row[x3+2] = ((int)row2[sx3+2]*iw + (int)row2[sx3+5]*wx) >> WEIGHT_SHIFT;
+                        } else if(wl == -1 && __builtin_expect(sx3 >= 3, 1)) {
+                            dst_row[x3]   = ((int)row2[sx3]  *iw + (int)row2[sx3-3]*wx) >> WEIGHT_SHIFT;
+                            dst_row[x3+1] = ((int)row2[sx3+1]*iw + (int)row2[sx3-2]*wx) >> WEIGHT_SHIFT;
+                            dst_row[x3+2] = ((int)row2[sx3+2]*iw + (int)row2[sx3-1]*wx) >> WEIGHT_SHIFT;
+                        } else {
+                            dst_row[x3]   = row2[sx3];
+                            dst_row[x3+1] = row2[sx3+1];
+                            dst_row[x3+2] = row2[sx3+2];
                         }
                     }
-                    else if(weighted)
+                    else
                     {
-                        int h2[3], h3[3];
-                        h_interp(row2, sx3, wl, wx, in_w3, weighted, 0, h2);
-                        h_interp(row3, sx3, wl, wx, in_w3, weighted, 0, h3);
-                        const int iw = WEIGHT_MAX - wy;
-                        for(int c = 0; c < 3; c++)
-                            dst_row[x3+c] = (h2[c]*iw + h3[c]*wy) >> WEIGHT_SHIFT;
+                        if(wl == 1 && __builtin_expect(sx3 + 3 < in_w3, 1)) {
+                            dst_row[x3]   = ((int)row2[sx3]   + (int)row2[sx3+3]) >> 1;
+                            dst_row[x3+1] = ((int)row2[sx3+1] + (int)row2[sx3+4]) >> 1;
+                            dst_row[x3+2] = ((int)row2[sx3+2] + (int)row2[sx3+5]) >> 1;
+                        } else if(wl == -1 && __builtin_expect(sx3 >= 3, 1)) {
+                            dst_row[x3]   = ((int)row2[sx3-3] + (int)row2[sx3])   >> 1;
+                            dst_row[x3+1] = ((int)row2[sx3-2] + (int)row2[sx3+1]) >> 1;
+                            dst_row[x3+2] = ((int)row2[sx3-1] + (int)row2[sx3+2]) >> 1;
+                        } else {
+                            dst_row[x3]   = row2[sx3];
+                            dst_row[x3+1] = row2[sx3+1];
+                            dst_row[x3+2] = row2[sx3+2];
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // interpolation verticale active
+                int x3 = 0;
+                for(int x = 0; x < out_w; x++, x3 += 3)
+                {
+                    const int sx  = map->w_src   [map_w_base + x];
+                    const int wl  = map->w_flag  [map_w_base + x];
+                    const int wx  = map->w_weight[map_w_base + x];
+                    const int sx3 = sx * 3;
+
+                    // indices horizontaux précalculés — réutilisés pour les 4 lignes
+                    int p1, p2, p3, p4;
+                    if(wl == 1) {
+                        p1 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
+                        p2 = sx3;
+                        p3 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
+                        p4 = __builtin_expect(sx3 + 6 < in_w3, 1) ? sx3 + 6 : p3;
+                    } else if(wl == -1) {
+                        p1 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
+                        p2 = sx3;
+                        p3 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
+                        p4 = __builtin_expect(sx3 >= 6,        1) ? sx3 - 6 : p3;
+                    } else {
+                        p1 = p2 = p3 = p4 = sx3;
+                    }
+
+                    if(wl == 0)
+                    {
+                        // cas 3 : vertical seulement
+                        if(mode5)
+                        {
+                            int v0 = ((int)row1[sx3]  *kv0 + (int)row2[sx3]  *kv1
+                                    + (int)row3[sx3]  *kv2 + (int)row4[sx3]  *kv3) >> WEIGHT_SHIFT;
+                            int v1 = ((int)row1[sx3+1]*kv0 + (int)row2[sx3+1]*kv1
+                                    + (int)row3[sx3+1]*kv2 + (int)row4[sx3+1]*kv3) >> WEIGHT_SHIFT;
+                            int v2 = ((int)row1[sx3+2]*kv0 + (int)row2[sx3+2]*kv1
+                                    + (int)row3[sx3+2]*kv2 + (int)row4[sx3+2]*kv3) >> WEIGHT_SHIFT;
+                            dst_row[x3]   = CLAMP255(v0);
+                            dst_row[x3+1] = CLAMP255(v1);
+                            dst_row[x3+2] = CLAMP255(v2);
+                        }
+                        else if(weighted)
+                        {
+                            dst_row[x3]   = ((int)row2[sx3]  *iwy + (int)row3[sx3]  *wy) >> WEIGHT_SHIFT;
+                            dst_row[x3+1] = ((int)row2[sx3+1]*iwy + (int)row3[sx3+1]*wy) >> WEIGHT_SHIFT;
+                            dst_row[x3+2] = ((int)row2[sx3+2]*iwy + (int)row3[sx3+2]*wy) >> WEIGHT_SHIFT;
+                        }
+                        else
+                        {
+                            dst_row[x3]   = ((int)row2[sx3]   + (int)row3[sx3])   >> 1;
+                            dst_row[x3+1] = ((int)row2[sx3+1] + (int)row3[sx3+1]) >> 1;
+                            dst_row[x3+2] = ((int)row2[sx3+2] + (int)row3[sx3+2]) >> 1;
+                        }
                     }
                     else
                     {
-                        // bilinear 50/50 2D
-                        int h2[3], h3[3];
-                        h_interp(row2, sx3, wl, wx, in_w3, 0, 0, h2);
-                        h_interp(row3, sx3, wl, wx, in_w3, 0, 0, h3);
-                        for(int c = 0; c < 3; c++)
-                            dst_row[x3+c] = (h2[c] + h3[c]) >> 1;
+                        // cas 4 : 2D
+                        if(mode5)
+                        {
+                            const int kh0 = kaiser4_lut[wx][0];
+                            const int kh1 = kaiser4_lut[wx][1];
+                            const int kh2 = kaiser4_lut[wx][2];
+                            const int kh3 = kaiser4_lut[wx][3];
+
+                            // interpolation horizontale sur les 4 lignes,
+                            // indices p1..p4 précalculés une seule fois
+                            int h10 = ((int)row1[p1]  *kh0 + (int)row1[p2]  *kh1
+                                     + (int)row1[p3]  *kh2 + (int)row1[p4]  *kh3) >> WEIGHT_SHIFT;
+                            int h11 = ((int)row1[p1+1]*kh0 + (int)row1[p2+1]*kh1
+                                     + (int)row1[p3+1]*kh2 + (int)row1[p4+1]*kh3) >> WEIGHT_SHIFT;
+                            int h12 = ((int)row1[p1+2]*kh0 + (int)row1[p2+2]*kh1
+                                     + (int)row1[p3+2]*kh2 + (int)row1[p4+2]*kh3) >> WEIGHT_SHIFT;
+
+                            int h20 = ((int)row2[p1]  *kh0 + (int)row2[p2]  *kh1
+                                     + (int)row2[p3]  *kh2 + (int)row2[p4]  *kh3) >> WEIGHT_SHIFT;
+                            int h21 = ((int)row2[p1+1]*kh0 + (int)row2[p2+1]*kh1
+                                     + (int)row2[p3+1]*kh2 + (int)row2[p4+1]*kh3) >> WEIGHT_SHIFT;
+                            int h22 = ((int)row2[p1+2]*kh0 + (int)row2[p2+2]*kh1
+                                     + (int)row2[p3+2]*kh2 + (int)row2[p4+2]*kh3) >> WEIGHT_SHIFT;
+
+                            int h30 = ((int)row3[p1]  *kh0 + (int)row3[p2]  *kh1
+                                     + (int)row3[p3]  *kh2 + (int)row3[p4]  *kh3) >> WEIGHT_SHIFT;
+                            int h31 = ((int)row3[p1+1]*kh0 + (int)row3[p2+1]*kh1
+                                     + (int)row3[p3+1]*kh2 + (int)row3[p4+1]*kh3) >> WEIGHT_SHIFT;
+                            int h32 = ((int)row3[p1+2]*kh0 + (int)row3[p2+2]*kh1
+                                     + (int)row3[p3+2]*kh2 + (int)row3[p4+2]*kh3) >> WEIGHT_SHIFT;
+
+                            int h40 = ((int)row4[p1]  *kh0 + (int)row4[p2]  *kh1
+                                     + (int)row4[p3]  *kh2 + (int)row4[p4]  *kh3) >> WEIGHT_SHIFT;
+                            int h41 = ((int)row4[p1+1]*kh0 + (int)row4[p2+1]*kh1
+                                     + (int)row4[p3+1]*kh2 + (int)row4[p4+1]*kh3) >> WEIGHT_SHIFT;
+                            int h42 = ((int)row4[p1+2]*kh0 + (int)row4[p2+2]*kh1
+                                     + (int)row4[p3+2]*kh2 + (int)row4[p4+2]*kh3) >> WEIGHT_SHIFT;
+
+                            // clamp intermédiaire avant combinaison verticale
+                            h10 = CLAMP255(h10); h11 = CLAMP255(h11); h12 = CLAMP255(h12);
+                            h20 = CLAMP255(h20); h21 = CLAMP255(h21); h22 = CLAMP255(h22);
+                            h30 = CLAMP255(h30); h31 = CLAMP255(h31); h32 = CLAMP255(h32);
+                            h40 = CLAMP255(h40); h41 = CLAMP255(h41); h42 = CLAMP255(h42);
+
+                            // combinaison verticale kaiser
+                            int v0 = (h10*kv0 + h20*kv1 + h30*kv2 + h40*kv3) >> WEIGHT_SHIFT;
+                            int v1 = (h11*kv0 + h21*kv1 + h31*kv2 + h41*kv3) >> WEIGHT_SHIFT;
+                            int v2 = (h12*kv0 + h22*kv1 + h32*kv2 + h42*kv3) >> WEIGHT_SHIFT;
+                            dst_row[x3]   = CLAMP255(v0);
+                            dst_row[x3+1] = CLAMP255(v1);
+                            dst_row[x3+2] = CLAMP255(v2);
+                        }
+                        else if(weighted)
+                        {
+                            const int iw = WEIGHT_MAX - wx;
+                            // interpolation horizontale sur les 2 lignes utiles
+                            int h20 = ((int)row2[sx3]  *iw + (int)row2[p3]  *wx) >> WEIGHT_SHIFT;
+                            int h21 = ((int)row2[sx3+1]*iw + (int)row2[p3+1]*wx) >> WEIGHT_SHIFT;
+                            int h22 = ((int)row2[sx3+2]*iw + (int)row2[p3+2]*wx) >> WEIGHT_SHIFT;
+                            int h30 = ((int)row3[sx3]  *iw + (int)row3[p3]  *wx) >> WEIGHT_SHIFT;
+                            int h31 = ((int)row3[sx3+1]*iw + (int)row3[p3+1]*wx) >> WEIGHT_SHIFT;
+                            int h32 = ((int)row3[sx3+2]*iw + (int)row3[p3+2]*wx) >> WEIGHT_SHIFT;
+                            dst_row[x3]   = (h20*iwy + h30*wy) >> WEIGHT_SHIFT;
+                            dst_row[x3+1] = (h21*iwy + h31*wy) >> WEIGHT_SHIFT;
+                            dst_row[x3+2] = (h22*iwy + h32*wy) >> WEIGHT_SHIFT;
+                        }
+                        else
+                        {
+                            // bilinear 50/50 2D
+                            int h20 = ((int)row2[sx3]   + (int)row2[p3])   >> 1;
+                            int h21 = ((int)row2[sx3+1] + (int)row2[p3+1]) >> 1;
+                            int h22 = ((int)row2[sx3+2] + (int)row2[p3+2]) >> 1;
+                            int h30 = ((int)row3[sx3]   + (int)row3[p3])   >> 1;
+                            int h31 = ((int)row3[sx3+1] + (int)row3[p3+1]) >> 1;
+                            int h32 = ((int)row3[sx3+2] + (int)row3[p3+2]) >> 1;
+                            dst_row[x3]   = (h20 + h30) >> 1;
+                            dst_row[x3+1] = (h21 + h31) >> 1;
+                            dst_row[x3+2] = (h22 + h32) >> 1;
+                        }
                     }
                 }
             }
