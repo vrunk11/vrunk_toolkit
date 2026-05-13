@@ -188,7 +188,7 @@ void usage(void)
         "\t                     3 = exponential weighted blending (uses --curve-base)\n"
 		"\t                     5 = kaiser 4-tap avec poids exponentiels\n"
         "\t--curve-base FLOAT exponential curve base for mode 4 / tmp-mode 3 (default: 2.0, must be > 1.0)\n\n"
-		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.0)\n"
+		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.5)\n"
 		"\t                     low = sharp/ringing, high = smooth/no ringing\n"
 		"\t--1d               use separable 1D pipeline (default: 2D)\n"
     );
@@ -650,8 +650,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
         for(int y = 0; y < out_h; y++)
         {
             const int sy = map->h_src   [map_h_base + y];
-            const int hl = map->h_flag  [map_h_base + y];
-            const int wy = map->h_weight[map_h_base + y];
+			const int hl = (mode >= 1) ? map->h_flag  [map_h_base + y] : 0;
+			const int wy = (mode >= 1) ? map->h_weight[map_h_base + y] : 0;
 
             unsigned char * restrict dst_row = out_buf + offset + y * out_w3;
 
@@ -692,8 +692,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
                     const int sx  = map->w_src   [map_w_base + x];
-                    const int wl  = map->w_flag  [map_w_base + x];
-                    const int wx  = map->w_weight[map_w_base + x];
+                    const int wl  = (mode >= 1) ? map->w_flag  [map_w_base + x] : 0;
+					const int wx  = (mode >= 1) ? map->w_weight[map_w_base + x] : 0;
                     const int sx3 = sx * 3;
 
                     if(wl == 0)
@@ -1190,7 +1190,7 @@ int main(int argc, char **argv)
 	int mode = 0;
 	int tmp_mode = 0;         // mode de blending temporel (0 = duplication)
 	double curve_base = 2.0;  // base de la courbe exponentielle (modes 4 / tmp 3)
-	double kaiser_beta = 2.0;  // défaut agressif, netteté maximale
+	double kaiser_beta = 2.5;  // défaut agressif, netteté maximale
 	int mode_1d = 0;  // défaut : 2D direct
 	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	
