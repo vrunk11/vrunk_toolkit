@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 #include <pthread.h>
 #include <getopt.h>
@@ -41,10 +42,16 @@
 #define CLAMP255(v)  ((v) < 0 ? 0 : (v) > 255 ? 255 : (v))  // ← ajouter ici
 
 typedef enum {
-	PIX_RGB  = 0,
-	PIX_444  = 1,
-	PIX_422  = 2,
-	PIX_420  = 3
+    PIX_RGB    = 0,
+    PIX_444P   = 1,
+    PIX_422P   = 2,
+    PIX_420P   = 3,
+    PIX_411P   = 4,
+    PIX_410P   = 5,
+    PIX_RGB48  = 6,
+    PIX_444P16 = 7,
+    PIX_422P16 = 8,
+    PIX_420P16 = 9,
 } PixFmt;
 
 typedef struct BresenhamMap BresenhamMap;
@@ -75,6 +82,8 @@ struct ThreadArgs
 	int mode_1d;
 	PixFmt in_pix_fmt;
 	PixFmt out_pix_fmt;
+	int bps_in;
+	int bps_out;
 	int in_w, in_h, out_w, out_h, ratio, mode;
 };
 
@@ -203,8 +212,10 @@ void usage(void)
 		"\t--kaiser-beta FLOAT  beta du noyau kaiser pour mode 5 (default: 2.5)\n"
 		"\t                     low = sharp/ringing, high = smooth/no ringing\n"
 		"\t--1d               use separable 1D pipeline (default: 2D)\n"
-		"\t--in-pix-fmt  STR  input pixel format  : RGB (default), 444, 422, 420\n"
-		"\t--out-pix-fmt STR  output pixel format : RGB (default), 444, 422, 420\n"
+		"\t--in-pix-fmt  STR  RGB, 444p, 422p, 420p, 411p, 410p,\n"
+		"\t                   RGB48, 444p16, 422p16, 420p16\n"
+		"\t--out-pix-fmt STR  output pixel format : RGB, 444p, 422p, 420p, 411p, 410p,\n"
+		"\t                   RGB48, 444p16, 422p16, 420p16\n"
 		"                     RGB<->YUV conversion not supported\n"
     );
     exit(1);
@@ -633,189 +644,212 @@ void process_files_plane(const unsigned char * restrict in_plane,
                          const int *tmp_weights,
                          const int in_w, const int in_h,
                          const int out_w, const int out_h,
-                         const int ratio, const int mode)
+                         const int ratio, const int mode,
+                         const int bps_in, const int bps_out)
 {
-    const int in_size  = in_w * in_h;
+    const int in_size  = in_w * in_h;  // en pixels, pas en bytes
     const int bilinear = (mode >= 1 && mode != 5);
     const int weighted = (mode == 3 || mode == 4);
-
+ 
+    // Lecture : normalise vers l'espace de calcul interne (toujours 0..65535)
+    // pour que les interpolations soient cohérentes quelle que soit la profondeur source
+    #define RD(ptr, x) \
+        ((bps_in == 1) ? ((int)(ptr)[x] << 8) \
+                       : (int)((const uint16_t*)(ptr))[x])
+	
+	#define RD_TMP(ptr, x) \
+    ((bps_out == 1) ? ((int)(ptr)[x] << 8) \
+                    : (int)((const uint16_t*)(ptr))[x])
+ 
+    // Écriture : dénormalise depuis l'espace 16-bit vers la profondeur cible
+    #define WR(ptr, x, v) do { \
+        int _v = (v); \
+        _v = _v < 0 ? 0 : _v > 65535 ? 65535 : _v; \
+        if(bps_out == 1) (ptr)[x]               = (unsigned char)(_v >> 8); \
+        else ((uint16_t*)(ptr))[x]              = (uint16_t)_v; \
+    } while(0)
+ 
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
     {
-        // blend temporel
         const int tw = tmp_weights[r];
         const unsigned char *src_plane;
         if(tw > 0 && next_plane != in_plane)
         {
             const int itw = WEIGHT_MAX - tw;
-            for(int i = 0; i < in_size; i++)
-                blend_plane[i] = (in_plane[i] * itw + next_plane[i] * tw) >> WEIGHT_SHIFT;
+            if(bps_in == 1) {
+                for(int i = 0; i < in_size; i++)
+                    blend_plane[i] = (in_plane[i]*itw + next_plane[i]*tw) >> WEIGHT_SHIFT;
+            } else {
+                const uint16_t *in16   = (const uint16_t *)in_plane;
+                const uint16_t *next16 = (const uint16_t *)next_plane;
+                      uint16_t *bl16   = (uint16_t *)blend_plane;
+                for(int i = 0; i < in_size; i++)
+                    bl16[i] = (in16[i]*itw + next16[i]*tw) >> WEIGHT_SHIFT;
+            }
             src_plane = blend_plane;
         }
         else
         {
             src_plane = in_plane;
         }
-
+ 
         const int map_w_base = r * out_w;
         const int map_h_base = r * out_h;
-
+ 
         // passe horizontale : in_plane → tmp_plane
         for(int h = 0; h < in_h; h++)
         {
-            const unsigned char * restrict src_row = src_plane + h * in_w;
-            unsigned char * restrict dst_row = tmp_plane + h * out_w;
-
+            const unsigned char *src_row = src_plane + h * in_w  * bps_in;
+			unsigned char       *dst_row = tmp_plane + h * out_w * bps_out;
+ 
             for(int px = 0; px < out_w; px++)
             {
                 const int src_px      = map->w_src [map_w_base + px];
                 const int is_bilinear = map->w_flag[map_w_base + px];
-
+ 
                 if(mode == 5 && is_bilinear != 0)
                 {
                     const int w = map->w_weight[map_w_base + px];
-                    if(w == 0)
-                    {
-                        dst_row[px] = src_row[src_px];
-                    }
-                    else
-                    {
+                    if(w == 0) {
+                        WR(dst_row, px, RD(src_row, src_px));
+                    } else {
                         const int kh0 = kaiser4_lut[w][0];
                         const int kh1 = kaiser4_lut[w][1];
                         const int kh2 = kaiser4_lut[w][2];
                         const int kh3 = kaiser4_lut[w][3];
                         int p1, p2, p3, p4;
                         if(is_bilinear == 1) {
-                            p1 = __builtin_expect(src_px >= 1,        1) ? src_px - 1 : src_px;
+                            p1 = __builtin_expect(src_px >= 1,       1) ? src_px-1 : src_px;
                             p2 = src_px;
-                            p3 = __builtin_expect(src_px + 1 < in_w,  1) ? src_px + 1 : src_px;
-                            p4 = __builtin_expect(src_px + 2 < in_w,  1) ? src_px + 2 : p3;
+                            p3 = __builtin_expect(src_px+1 < in_w,   1) ? src_px+1 : src_px;
+                            p4 = __builtin_expect(src_px+2 < in_w,   1) ? src_px+2 : p3;
                         } else {
-                            p1 = __builtin_expect(src_px + 1 < in_w,  1) ? src_px + 1 : src_px;
+                            p1 = __builtin_expect(src_px+1 < in_w,   1) ? src_px+1 : src_px;
                             p2 = src_px;
-                            p3 = __builtin_expect(src_px >= 1,        1) ? src_px - 1 : src_px;
-                            p4 = __builtin_expect(src_px >= 2,        1) ? src_px - 2 : p3;
+                            p3 = __builtin_expect(src_px >= 1,        1) ? src_px-1 : src_px;
+                            p4 = __builtin_expect(src_px >= 2,        1) ? src_px-2 : p3;
                         }
-                        int v = ((int)src_row[p1]*kh0 + (int)src_row[p2]*kh1
-                               + (int)src_row[p3]*kh2 + (int)src_row[p4]*kh3) >> WEIGHT_SHIFT;
-                        dst_row[px] = CLAMP255(v);
+                        int v = (RD(src_row,p1)*kh0 + RD(src_row,p2)*kh1
+                               + RD(src_row,p3)*kh2 + RD(src_row,p4)*kh3) >> WEIGHT_SHIFT;
+                        WR(dst_row, px, v);
                     }
                 }
-                else if(weighted && is_bilinear == 1 && src_px + 1 < in_w)
+                else if(weighted && is_bilinear == 1 && src_px+1 < in_w)
                 {
                     const int w  = map->w_weight[map_w_base + px];
                     const int iw = WEIGHT_MAX - w;
-                    dst_row[px] = ((int)src_row[src_px]*iw + (int)src_row[src_px+1]*w) >> WEIGHT_SHIFT;
+                    WR(dst_row, px, (RD(src_row,src_px)*iw + RD(src_row,src_px+1)*w) >> WEIGHT_SHIFT);
                 }
                 else if(weighted && is_bilinear == -1 && src_px >= 1)
                 {
                     const int w  = map->w_weight[map_w_base + px];
                     const int iw = WEIGHT_MAX - w;
-                    dst_row[px] = ((int)src_row[src_px]*iw + (int)src_row[src_px-1]*w) >> WEIGHT_SHIFT;
+                    WR(dst_row, px, (RD(src_row,src_px)*iw + RD(src_row,src_px-1)*w) >> WEIGHT_SHIFT);
                 }
-                else if(bilinear && is_bilinear == 1 && src_px + 1 < in_w)
+                else if(bilinear && is_bilinear == 1 && src_px+1 < in_w)
                 {
-                    dst_row[px] = ((int)src_row[src_px] + (int)src_row[src_px+1]) >> 1;
+                    WR(dst_row, px, (RD(src_row,src_px) + RD(src_row,src_px+1)) >> 1);
                 }
                 else if(bilinear && is_bilinear == -1 && src_px >= 1)
                 {
-                    dst_row[px] = ((int)src_row[src_px-1] + (int)src_row[src_px]) >> 1;
+                    WR(dst_row, px, (RD(src_row,src_px-1) + RD(src_row,src_px)) >> 1);
                 }
                 else
                 {
-                    dst_row[px] = src_row[src_px];
+                    WR(dst_row, px, RD(src_row, src_px));
                 }
             }
         }
-
+ 
         // passe verticale : tmp_plane → out_plane
         for(int px = 0; px < out_h; px++)
         {
             const int src_line    = map->h_src [map_h_base + px];
             const int is_bilinear = map->h_flag[map_h_base + px];
-
-            unsigned char * restrict dst_row        = out_plane + offset + px * out_w;
-            const unsigned char * restrict tmp_row0 = tmp_plane + src_line * out_w;
-
+ 
+            const unsigned char *tmp_row0 = tmp_plane + src_line * out_w * bps_out;
+			unsigned char *dst_row = out_plane + offset + px * out_w * bps_out;
+ 
             if(mode == 5 && is_bilinear != 0)
             {
                 const int w = map->h_weight[map_h_base + px];
-                if(w == 0)
-                {
-                    memcpy(dst_row, tmp_row0, out_w);
-                }
-                else
-                {
+                if(w == 0) {
+                    memcpy(dst_row, tmp_row0, out_w * bps_out);
+                } else {
                     const int kv0 = kaiser4_lut[w][0];
                     const int kv1 = kaiser4_lut[w][1];
                     const int kv2 = kaiser4_lut[w][2];
                     const int kv3 = kaiser4_lut[w][3];
                     int l1, l2, l3, l4;
                     if(is_bilinear == 1) {
-                        l1 = __builtin_expect(src_line >= 1,       1) ? src_line - 1 : src_line;
+                        l1 = __builtin_expect(src_line >= 1,       1) ? src_line-1 : src_line;
                         l2 = src_line;
-                        l3 = __builtin_expect(src_line + 1 < in_h, 1) ? src_line + 1 : src_line;
-                        l4 = __builtin_expect(src_line + 2 < in_h, 1) ? src_line + 2 : l3;
+                        l3 = __builtin_expect(src_line+1 < in_h,   1) ? src_line+1 : src_line;
+                        l4 = __builtin_expect(src_line+2 < in_h,   1) ? src_line+2 : l3;
                     } else {
-                        l1 = __builtin_expect(src_line + 1 < in_h, 1) ? src_line + 1 : src_line;
+                        l1 = __builtin_expect(src_line+1 < in_h,   1) ? src_line+1 : src_line;
                         l2 = src_line;
-                        l3 = __builtin_expect(src_line >= 1,       1) ? src_line - 1 : src_line;
-                        l4 = __builtin_expect(src_line >= 2,       1) ? src_line - 2 : l3;
+                        l3 = __builtin_expect(src_line >= 1,        1) ? src_line-1 : src_line;
+                        l4 = __builtin_expect(src_line >= 2,        1) ? src_line-2 : l3;
                     }
-                    const unsigned char * restrict r1 = tmp_plane + l1 * out_w;
-                    const unsigned char * restrict r2 = tmp_plane + l2 * out_w;
-                    const unsigned char * restrict r3 = tmp_plane + l3 * out_w;
-                    const unsigned char * restrict r4 = tmp_plane + l4 * out_w;
+                    const unsigned char *r1 = tmp_plane + l1 * out_w * bps_out;
+                    const unsigned char *r2 = tmp_plane + l2 * out_w * bps_out;
+                    const unsigned char *r3 = tmp_plane + l3 * out_w * bps_out;
+                    const unsigned char *r4 = tmp_plane + l4 * out_w * bps_out;
                     for(int i = 0; i < out_w; i++) {
-                        int v = ((int)r1[i]*kv0 + (int)r2[i]*kv1
-                               + (int)r3[i]*kv2 + (int)r4[i]*kv3) >> WEIGHT_SHIFT;
-                        dst_row[i] = CLAMP255(v);
+                        int v = (RD_TMP(r1,i)*kv0 + RD_TMP(r2,i)*kv1
+                               + RD_TMP(r3,i)*kv2 + RD_TMP(r4,i)*kv3) >> WEIGHT_SHIFT;
+                        WR(dst_row, i, v);
                     }
                 }
             }
-            else if(weighted && is_bilinear == 1 && src_line + 1 < in_h)
+            else if(weighted && is_bilinear == 1 && src_line+1 < in_h)
             {
-                const int w  = map->h_weight[map_h_base + px];
+                const int w = map->h_weight[map_h_base + px];
                 if(w == 0) {
-                    memcpy(dst_row, tmp_row0, out_w);
+                    memcpy(dst_row, tmp_row0, out_w * bps_out);
                 } else {
                     const int iw = WEIGHT_MAX - w;
-                    const unsigned char * restrict tmp_row1 = tmp_row0 + out_w;
+                    const unsigned char *tmp_row1 = tmp_row0 + out_w * bps_out;
                     for(int i = 0; i < out_w; i++)
-                        dst_row[i] = ((int)tmp_row0[i]*iw + (int)tmp_row1[i]*w) >> WEIGHT_SHIFT;
+                        WR(dst_row, i, (RD_TMP(tmp_row0,i)*iw + RD_TMP(tmp_row1,i)*w) >> WEIGHT_SHIFT);
                 }
             }
             else if(weighted && is_bilinear == -1 && src_line >= 1)
             {
-                const int w  = map->h_weight[map_h_base + px];
+                const int w = map->h_weight[map_h_base + px];
                 if(w == 0) {
-                    memcpy(dst_row, tmp_row0, out_w);
+                    memcpy(dst_row, tmp_row0, out_w * bps_out);
                 } else {
                     const int iw = WEIGHT_MAX - w;
-                    const unsigned char * restrict tmp_row_1 = tmp_row0 - out_w;
+                    const unsigned char *tmp_row_1 = tmp_row0 - out_w * bps_out;
                     for(int i = 0; i < out_w; i++)
-                        dst_row[i] = ((int)tmp_row0[i]*iw + (int)tmp_row_1[i]*w) >> WEIGHT_SHIFT;
+                        WR(dst_row, i, (RD_TMP(tmp_row0,i)*iw + RD_TMP(tmp_row_1,i)*w) >> WEIGHT_SHIFT);
                 }
             }
-            else if(bilinear && is_bilinear == 1 && src_line + 1 < in_h)
+            else if(bilinear && is_bilinear == 1 && src_line+1 < in_h)
             {
-                const unsigned char * restrict tmp_row1 = tmp_row0 + out_w;
+                const unsigned char *tmp_row1 = tmp_row0 + out_w * bps_out;
                 for(int i = 0; i < out_w; i++)
-                    dst_row[i] = ((int)tmp_row0[i] + (int)tmp_row1[i]) >> 1;
+                    WR(dst_row, i, (RD_TMP(tmp_row0,i) + RD_TMP(tmp_row1,i)) >> 1);
             }
             else if(bilinear && is_bilinear == -1 && src_line >= 1)
             {
-                const unsigned char * restrict tmp_row_1 = tmp_row0 - out_w;
+                const unsigned char *tmp_row_1 = tmp_row0 - out_w * bps_out;
                 for(int i = 0; i < out_w; i++)
-                    dst_row[i] = ((int)tmp_row_1[i] + (int)tmp_row0[i]) >> 1;
+                    WR(dst_row, i, (RD_TMP(tmp_row_1,i) + RD_TMP(tmp_row0,i)) >> 1);
             }
             else
             {
-                memcpy(dst_row, tmp_row0, out_w);
+                memcpy(dst_row, tmp_row0, out_w * bps_out);
             }
         }
-        offset += out_w * out_h;
+        offset += out_w * out_h * bps_out;
     }
+    #undef RD
+	#undef RD_TMP
+    #undef WR
 }
 
 // ============================================================
@@ -830,12 +864,27 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                              const int *tmp_weights,
                              const int in_w, const int in_h,
                              const int out_w, const int out_h,
-                             const int ratio, const int mode)
+                             const int ratio, const int mode,
+                             const int bps_in, const int bps_out)
 {
     const int in_size  = in_w * in_h;
     const int weighted = (mode == 3 || mode == 4 || mode == 5);
     const int mode5    = (mode == 5);
-
+		 
+	// Lecture : normalise vers l'espace de calcul interne (toujours 0..65535)
+	// pour que les interpolations soient cohérentes quelle que soit la profondeur source
+	#define RD(row, x) \
+		((bps_in == 1) ? ((int)(row##_8)[x] << 8) \
+					   : (int)((row##_16)[x]))
+		 
+	// Écriture : dénormalise depuis l'espace 16-bit vers la profondeur cible
+	#define WR(x, v) do { \
+		int _v = (v); \
+		_v = _v < 0 ? 0 : _v > 65535 ? 65535 : _v; \
+		if(bps_out == 1) dst_row_8[x]  = (unsigned char)(_v >> 8); \
+		else             dst16    [x]  = (uint16_t)_v; \
+	} while(0)
+ 
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
     {
@@ -844,26 +893,35 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
         if(tw > 0 && next_plane != in_plane)
         {
             const int itw = WEIGHT_MAX - tw;
-            for(int i = 0; i < in_size; i++)
-                blend_plane[i] = (in_plane[i] * itw + next_plane[i] * tw) >> WEIGHT_SHIFT;
+            if(bps_in == 1) {
+                for(int i = 0; i < in_size; i++)
+                    blend_plane[i] = (in_plane[i]*itw + next_plane[i]*tw) >> WEIGHT_SHIFT;
+            } else {
+                const uint16_t *in16   = (const uint16_t *)in_plane;
+                const uint16_t *next16 = (const uint16_t *)next_plane;
+                      uint16_t *bl16   = (uint16_t *)blend_plane;
+                for(int i = 0; i < in_size; i++)
+                    bl16[i] = (in16[i]*itw + next16[i]*tw) >> WEIGHT_SHIFT;
+            }
             src_plane = blend_plane;
         }
         else
         {
             src_plane = in_plane;
         }
-
+ 
         const int map_w_base = r * out_w;
         const int map_h_base = r * out_h;
-
+ 
         for(int y = 0; y < out_h; y++)
         {
             const int sy = map->h_src   [map_h_base + y];
             const int hl = (mode >= 1) ? map->h_flag  [map_h_base + y] : 0;
             const int wy = (mode >= 1) ? map->h_weight[map_h_base + y] : 0;
-
-            unsigned char * restrict dst_row = out_plane + offset + y * out_w;
-
+ 
+            // pointeurs typés pour les lignes verticales
+            uint16_t       *dst16 = (uint16_t *)(out_plane + offset + y * out_w * bps_out);
+ 
             int l1, l2, l3, l4;
             if(hl == 1) {
                 l1 = __builtin_expect(sy >= 1,       1) ? sy - 1 : sy;
@@ -878,24 +936,30 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
             } else {
                 l1 = l2 = l3 = l4 = sy;
             }
-
-            const unsigned char * restrict row1 = src_plane + l1 * in_w;
-            const unsigned char * restrict row2 = src_plane + l2 * in_w;
-            const unsigned char * restrict row3 = src_plane + l3 * in_w;
-            const unsigned char * restrict row4 = src_plane + l4 * in_w;
-
+ 
+            // pointeurs lignes — un seul calcul, utilisés pour 8 ET 16-bit
+            const unsigned char *row1_8  = src_plane + l1 * in_w * bps_in;
+            const unsigned char *row2_8  = src_plane + l2 * in_w * bps_in;
+            const unsigned char *row3_8  = src_plane + l3 * in_w * bps_in;
+            const unsigned char *row4_8  = src_plane + l4 * in_w * bps_in;
+            const uint16_t      *row1_16 = (const uint16_t *)row1_8;
+            const uint16_t      *row2_16 = (const uint16_t *)row2_8;
+            const uint16_t      *row3_16 = (const uint16_t *)row3_8;
+            const uint16_t      *row4_16 = (const uint16_t *)row4_8;
+ 
+            unsigned char *dst_row_8 = out_plane + offset + y * out_w * bps_out;
+ 
             int kv0 = 0, kv1 = 0, kv2 = 0, kv3 = 0;
-			int iwy = 0;
-
-			if(mode5) {
-				kv0 = kaiser4_lut[wy][0];
-				kv1 = kaiser4_lut[wy][1];
-				kv2 = kaiser4_lut[wy][2];
-				kv3 = kaiser4_lut[wy][3];
-			} else if(weighted) {
-				iwy = WEIGHT_MAX - wy;
-			}
-
+            int iwy = 0;
+            if(mode5) {
+                kv0 = kaiser4_lut[wy][0];
+                kv1 = kaiser4_lut[wy][1];
+                kv2 = kaiser4_lut[wy][2];
+                kv3 = kaiser4_lut[wy][3];
+            } else if(weighted) {
+                iwy = WEIGHT_MAX - wy;
+            }
+ 
             if(hl == 0)
             {
                 for(int x = 0; x < out_w; x++)
@@ -903,10 +967,10 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                     const int sx = map->w_src   [map_w_base + x];
                     const int wl = (mode >= 1) ? map->w_flag  [map_w_base + x] : 0;
                     const int wx = (mode >= 1) ? map->w_weight[map_w_base + x] : 0;
-
+ 
                     if(wl == 0)
                     {
-                        dst_row[x] = row2[sx];
+                        WR(x, RD(row2, sx));
                     }
                     else if(mode5)
                     {
@@ -926,28 +990,22 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                             p3 = __builtin_expect(sx >= 1,       1) ? sx - 1 : sx;
                             p4 = __builtin_expect(sx >= 2,       1) ? sx - 2 : p3;
                         }
-                        int v = ((int)row2[p1]*kh0 + (int)row2[p2]*kh1
-                               + (int)row2[p3]*kh2 + (int)row2[p4]*kh3) >> WEIGHT_SHIFT;
-                        dst_row[x] = CLAMP255(v);
+                        int v = (RD(row2,p1)*kh0 + RD(row2,p2)*kh1
+                               + RD(row2,p3)*kh2 + RD(row2,p4)*kh3) >> WEIGHT_SHIFT;
+                        WR(x, v);
                     }
                     else if(weighted)
                     {
                         const int iw = WEIGHT_MAX - wx;
-                        if(wl == 1 && __builtin_expect(sx + 1 < in_w, 1))
-                            dst_row[x] = ((int)row2[sx]*iw + (int)row2[sx+1]*wx) >> WEIGHT_SHIFT;
-                        else if(wl == -1 && __builtin_expect(sx >= 1, 1))
-                            dst_row[x] = ((int)row2[sx]*iw + (int)row2[sx-1]*wx) >> WEIGHT_SHIFT;
-                        else
-                            dst_row[x] = row2[sx];
+                        int sx1 = (wl == 1) ? (__builtin_expect(sx+1 < in_w,1) ? sx+1 : sx)
+                                            : (__builtin_expect(sx >= 1,    1) ? sx-1 : sx);
+                        WR(x, (RD(row2,sx)*iw + RD(row2,sx1)*wx) >> WEIGHT_SHIFT);
                     }
                     else
                     {
-                        if(wl == 1 && __builtin_expect(sx + 1 < in_w, 1))
-                            dst_row[x] = ((int)row2[sx] + (int)row2[sx+1]) >> 1;
-                        else if(wl == -1 && __builtin_expect(sx >= 1, 1))
-                            dst_row[x] = ((int)row2[sx-1] + (int)row2[sx]) >> 1;
-                        else
-                            dst_row[x] = row2[sx];
+                        int sx1 = (wl == 1) ? (__builtin_expect(sx+1 < in_w,1) ? sx+1 : sx)
+                                            : (__builtin_expect(sx >= 1,    1) ? sx-1 : sx);
+                        WR(x, (RD(row2,sx) + RD(row2,sx1)) >> 1);
                     }
                 }
             }
@@ -958,7 +1016,7 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                     const int sx = map->w_src   [map_w_base + x];
                     const int wl = (mode >= 1) ? map->w_flag  [map_w_base + x] : 0;
                     const int wx = (mode >= 1) ? map->w_weight[map_w_base + x] : 0;
-
+ 
                     int p1, p2, p3, p4;
                     if(wl == 1) {
                         p1 = __builtin_expect(sx >= 1,       1) ? sx - 1 : sx;
@@ -973,67 +1031,69 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                     } else {
                         p1 = p2 = p3 = p4 = sx;
                     }
-
+ 
                     if(wl == 0)
                     {
-                        // vertical seulement
                         if(mode5)
                         {
-                            int v = ((int)row1[sx]*kv0 + (int)row2[sx]*kv1
-                                   + (int)row3[sx]*kv2 + (int)row4[sx]*kv3) >> WEIGHT_SHIFT;
-                            dst_row[x] = CLAMP255(v);
+                            int v = (RD(row1,sx)*kv0 + RD(row2,sx)*kv1
+                                   + RD(row3,sx)*kv2 + RD(row4,sx)*kv3) >> WEIGHT_SHIFT;
+                            WR(x, v);
                         }
                         else if(weighted)
                         {
-                            dst_row[x] = ((int)row2[sx]*iwy + (int)row3[sx]*wy) >> WEIGHT_SHIFT;
+                            WR(x, (RD(row2,sx)*iwy + RD(row3,sx)*wy) >> WEIGHT_SHIFT);
                         }
                         else
                         {
-                            dst_row[x] = ((int)row2[sx] + (int)row3[sx]) >> 1;
+                            WR(x, (RD(row2,sx) + RD(row3,sx)) >> 1);
                         }
                     }
                     else
                     {
-                        // 2D
                         if(mode5)
                         {
                             const int kh0 = kaiser4_lut[wx][0];
                             const int kh1 = kaiser4_lut[wx][1];
                             const int kh2 = kaiser4_lut[wx][2];
                             const int kh3 = kaiser4_lut[wx][3];
-
-                            int h1 = ((int)row1[p1]*kh0 + (int)row1[p2]*kh1
-                                    + (int)row1[p3]*kh2 + (int)row1[p4]*kh3) >> WEIGHT_SHIFT;
-                            int h2 = ((int)row2[p1]*kh0 + (int)row2[p2]*kh1
-                                    + (int)row2[p3]*kh2 + (int)row2[p4]*kh3) >> WEIGHT_SHIFT;
-                            int h3 = ((int)row3[p1]*kh0 + (int)row3[p2]*kh1
-                                    + (int)row3[p3]*kh2 + (int)row3[p4]*kh3) >> WEIGHT_SHIFT;
-                            int h4 = ((int)row4[p1]*kh0 + (int)row4[p2]*kh1
-                                    + (int)row4[p3]*kh2 + (int)row4[p4]*kh3) >> WEIGHT_SHIFT;
-                            h1 = CLAMP255(h1); h2 = CLAMP255(h2);
-                            h3 = CLAMP255(h3); h4 = CLAMP255(h4);
+                            int h1 = (RD(row1,p1)*kh0 + RD(row1,p2)*kh1
+                                    + RD(row1,p3)*kh2 + RD(row1,p4)*kh3) >> WEIGHT_SHIFT;
+                            int h2 = (RD(row2,p1)*kh0 + RD(row2,p2)*kh1
+                                    + RD(row2,p3)*kh2 + RD(row2,p4)*kh3) >> WEIGHT_SHIFT;
+                            int h3 = (RD(row3,p1)*kh0 + RD(row3,p2)*kh1
+                                    + RD(row3,p3)*kh2 + RD(row3,p4)*kh3) >> WEIGHT_SHIFT;
+                            int h4 = (RD(row4,p1)*kh0 + RD(row4,p2)*kh1
+                                    + RD(row4,p3)*kh2 + RD(row4,p4)*kh3) >> WEIGHT_SHIFT;
+                            // clamp intermédiaire
+                            h1 = h1 < 0 ? 0 : h1 > 65535 ? 65535 : h1;
+							h2 = h2 < 0 ? 0 : h2 > 65535 ? 65535 : h2;
+							h3 = h3 < 0 ? 0 : h3 > 65535 ? 65535 : h3;
+							h4 = h4 < 0 ? 0 : h4 > 65535 ? 65535 : h4;
                             int v = (h1*kv0 + h2*kv1 + h3*kv2 + h4*kv3) >> WEIGHT_SHIFT;
-                            dst_row[x] = CLAMP255(v);
+                            WR(x, v);
                         }
                         else if(weighted)
                         {
                             const int iw = WEIGHT_MAX - wx;
-                            int h2 = ((int)row2[sx]*iw + (int)row2[p3]*wx) >> WEIGHT_SHIFT;
-                            int h3 = ((int)row3[sx]*iw + (int)row3[p3]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x] = (h2*iwy + h3*wy) >> WEIGHT_SHIFT;
+                            int h2 = (RD(row2,sx)*iw + RD(row2,p3)*wx) >> WEIGHT_SHIFT;
+                            int h3 = (RD(row3,sx)*iw + RD(row3,p3)*wx) >> WEIGHT_SHIFT;
+                            WR(x, (h2*iwy + h3*wy) >> WEIGHT_SHIFT);
                         }
                         else
                         {
-                            int h2 = ((int)row2[sx] + (int)row2[p3]) >> 1;
-                            int h3 = ((int)row3[sx] + (int)row3[p3]) >> 1;
-                            dst_row[x] = (h2 + h3) >> 1;
+                            int h2 = (RD(row2,sx) + RD(row2,p3)) >> 1;
+                            int h3 = (RD(row3,sx) + RD(row3,p3)) >> 1;
+                            WR(x, (h2 + h3) >> 1);
                         }
                     }
                 }
             }
         }
-        offset += out_w * out_h;
+        offset += out_w * out_h * bps_out;
     }
+	#undef RD
+    #undef WR
 }
 
 // ============================================================
@@ -1049,161 +1109,119 @@ void process_files_2d(const unsigned char * restrict in_buf,
                       const int *tmp_weights,
                       const int in_w, const int in_h,
                       const int out_w, const int out_h,
-                      const int ratio, const int mode)
+                      const int ratio, const int mode,
+                      const int bps_in, const int bps_out)
 {
     const int in_w3    = in_w * 3;
     const int out_w3   = out_w * 3;
     const int in_size  = in_w * in_h * 3;
     const int weighted = (mode == 3 || mode == 4 || mode == 5);
     const int mode5    = (mode == 5);
-
+ 
+    #define RD3(ptr, i) \
+        ((bps_in == 1) ? ((int)(ptr)[i] << 8) \
+                       : (int)((const uint16_t*)(ptr))[i])
+ 
+    #define WR3(ptr, i, v) do { \
+        int _v = (v); \
+        _v = _v < 0 ? 0 : _v > 65535 ? 65535 : _v; \
+        if(bps_out == 1) (ptr)[i]               = (unsigned char)(_v >> 8); \
+        else ((uint16_t*)(ptr))[i]              = (uint16_t)_v; \
+    } while(0)
+ 
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
     {
         const int tw = tmp_weights[r];
-        const unsigned char *src_buf;
+        const unsigned char *src_buf_ptr;
         if(tw > 0 && next_buf != in_buf)
         {
             const int itw = WEIGHT_MAX - tw;
-            for(int i = 0; i < in_size; i++)
-                blend_buf[i] = (in_buf[i] * itw + next_buf[i] * tw) >> WEIGHT_SHIFT;
-            src_buf = blend_buf;
+            if(bps_in == 1) {
+                for(int i = 0; i < in_size; i++)
+                    blend_buf[i] = (in_buf[i]*itw + next_buf[i]*tw) >> WEIGHT_SHIFT;
+            } else {
+                const uint16_t *in16   = (const uint16_t *)in_buf;
+                const uint16_t *next16 = (const uint16_t *)next_buf;
+                      uint16_t *bl16   = (uint16_t *)blend_buf;
+                for(int i = 0; i < in_size; i++)
+                    bl16[i] = (in16[i]*itw + next16[i]*tw) >> WEIGHT_SHIFT;
+            }
+            src_buf_ptr = blend_buf;
         }
-        else
-        {
-            src_buf = in_buf;
-        }
-
+        else { src_buf_ptr = in_buf; }
+ 
         const int map_w_base = r * out_w;
         const int map_h_base = r * out_h;
-
+ 
         for(int y = 0; y < out_h; y++)
         {
             const int sy = map->h_src   [map_h_base + y];
-			const int hl = (mode >= 1) ? map->h_flag  [map_h_base + y] : 0;
-			const int wy = (mode >= 1) ? map->h_weight[map_h_base + y] : 0;
-
-            unsigned char * restrict dst_row = out_buf + offset + y * out_w3;
-
-            // lignes verticales — constantes pour toute la ligne output y
+            const int hl = (mode >= 1) ? map->h_flag  [map_h_base + y] : 0;
+            const int wy = (mode >= 1) ? map->h_weight[map_h_base + y] : 0;
+ 
+            unsigned char *dst_row = out_buf + offset + y * out_w3 * bps_out;
+ 
             int l1, l2, l3, l4;
             if(hl == 1) {
-                l1 = __builtin_expect(sy >= 1,       1) ? sy - 1 : sy;
+                l1 = __builtin_expect(sy >= 1,       1) ? sy-1 : sy;
                 l2 = sy;
-                l3 = __builtin_expect(sy + 1 < in_h, 1) ? sy + 1 : sy;
-                l4 = __builtin_expect(sy + 2 < in_h, 1) ? sy + 2 : l3;
+                l3 = __builtin_expect(sy+1 < in_h,   1) ? sy+1 : sy;
+                l4 = __builtin_expect(sy+2 < in_h,   1) ? sy+2 : l3;
             } else if(hl == -1) {
-                l1 = __builtin_expect(sy + 1 < in_h, 1) ? sy + 1 : sy;
+                l1 = __builtin_expect(sy+1 < in_h,   1) ? sy+1 : sy;
                 l2 = sy;
-                l3 = __builtin_expect(sy >= 1,       1) ? sy - 1 : sy;
-                l4 = __builtin_expect(sy >= 2,       1) ? sy - 2 : l3;
-            } else {
-                l1 = l2 = l3 = l4 = sy;
-            }
-
-            const unsigned char * restrict row1 = src_buf + l1 * in_w3;
-            const unsigned char * restrict row2 = src_buf + l2 * in_w3;
-            const unsigned char * restrict row3 = src_buf + l3 * in_w3;
-            const unsigned char * restrict row4 = src_buf + l4 * in_w3;
-
-            // poids verticaux kaiser — constants pour toute la ligne
-            int kv0 = 0, kv1 = 0, kv2 = 0, kv3 = 0;
-			int iwy = 0;
-
-			if(mode5) {
-				kv0 = kaiser4_lut[wy][0];
-				kv1 = kaiser4_lut[wy][1];
-				kv2 = kaiser4_lut[wy][2];
-				kv3 = kaiser4_lut[wy][3];
-			} else if(weighted) {
-				iwy = WEIGHT_MAX - wy;
-			}
-
-            // --- branche hl hissée hors de la boucle x ---
-
+                l3 = __builtin_expect(sy >= 1,        1) ? sy-1 : sy;
+                l4 = __builtin_expect(sy >= 2,        1) ? sy-2 : l3;
+            } else { l1 = l2 = l3 = l4 = sy; }
+ 
+            const unsigned char *row1 = src_buf_ptr + l1 * in_w3 * bps_in;
+            const unsigned char *row2 = src_buf_ptr + l2 * in_w3 * bps_in;
+            const unsigned char *row3 = src_buf_ptr + l3 * in_w3 * bps_in;
+            const unsigned char *row4 = src_buf_ptr + l4 * in_w3 * bps_in;
+ 
+            int kv0 = 0, kv1 = 0, kv2 = 0, kv3 = 0, iwy = 0;
+            if(mode5) {
+                kv0 = kaiser4_lut[wy][0]; kv1 = kaiser4_lut[wy][1];
+                kv2 = kaiser4_lut[wy][2]; kv3 = kaiser4_lut[wy][3];
+            } else if(weighted) { iwy = WEIGHT_MAX - wy; }
+ 
             if(hl == 0)
             {
-                // pas d'interpolation verticale
                 int x3 = 0;
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
                     const int sx  = map->w_src   [map_w_base + x];
                     const int wl  = (mode >= 1) ? map->w_flag  [map_w_base + x] : 0;
-					const int wx  = (mode >= 1) ? map->w_weight[map_w_base + x] : 0;
+                    const int wx  = (mode >= 1) ? map->w_weight[map_w_base + x] : 0;
                     const int sx3 = sx * 3;
-
-                    if(wl == 0)
-                    {
-                        dst_row[x3]   = row2[sx3];
-                        dst_row[x3+1] = row2[sx3+1];
-                        dst_row[x3+2] = row2[sx3+2];
-                    }
-                    else if(mode5)
-                    {
-                        const int kh0 = kaiser4_lut[wx][0];
-                        const int kh1 = kaiser4_lut[wx][1];
-                        const int kh2 = kaiser4_lut[wx][2];
-                        const int kh3 = kaiser4_lut[wx][3];
-                        int p1, p2, p3, p4;
-                        if(wl == 1) {
-                            p1 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
-                            p2 = sx3;
-                            p3 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
-                            p4 = __builtin_expect(sx3 + 6 < in_w3, 1) ? sx3 + 6 : p3;
-                        } else {
-                            p1 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
-                            p2 = sx3;
-                            p3 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
-                            p4 = __builtin_expect(sx3 >= 6,        1) ? sx3 - 6 : p3;
-                        }
-                        int v0 = ((int)row2[p1]  *kh0 + (int)row2[p2]  *kh1
-                                + (int)row2[p3]  *kh2 + (int)row2[p4]  *kh3) >> WEIGHT_SHIFT;
-                        int v1 = ((int)row2[p1+1]*kh0 + (int)row2[p2+1]*kh1
-                                + (int)row2[p3+1]*kh2 + (int)row2[p4+1]*kh3) >> WEIGHT_SHIFT;
-                        int v2 = ((int)row2[p1+2]*kh0 + (int)row2[p2+2]*kh1
-                                + (int)row2[p3+2]*kh2 + (int)row2[p4+2]*kh3) >> WEIGHT_SHIFT;
-                        dst_row[x3]   = CLAMP255(v0);
-                        dst_row[x3+1] = CLAMP255(v1);
-                        dst_row[x3+2] = CLAMP255(v2);
-                    }
-                    else if(weighted)
-                    {
-                        const int iw = WEIGHT_MAX - wx;
-                        if(wl == 1 && __builtin_expect(sx3 + 3 < in_w3, 1)) {
-                            dst_row[x3]   = ((int)row2[sx3]  *iw + (int)row2[sx3+3]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x3+1] = ((int)row2[sx3+1]*iw + (int)row2[sx3+4]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x3+2] = ((int)row2[sx3+2]*iw + (int)row2[sx3+5]*wx) >> WEIGHT_SHIFT;
-                        } else if(wl == -1 && __builtin_expect(sx3 >= 3, 1)) {
-                            dst_row[x3]   = ((int)row2[sx3]  *iw + (int)row2[sx3-3]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x3+1] = ((int)row2[sx3+1]*iw + (int)row2[sx3-2]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x3+2] = ((int)row2[sx3+2]*iw + (int)row2[sx3-1]*wx) >> WEIGHT_SHIFT;
-                        } else {
-                            dst_row[x3]   = row2[sx3];
-                            dst_row[x3+1] = row2[sx3+1];
-                            dst_row[x3+2] = row2[sx3+2];
-                        }
-                    }
-                    else
-                    {
-                        if(wl == 1 && __builtin_expect(sx3 + 3 < in_w3, 1)) {
-                            dst_row[x3]   = ((int)row2[sx3]   + (int)row2[sx3+3]) >> 1;
-                            dst_row[x3+1] = ((int)row2[sx3+1] + (int)row2[sx3+4]) >> 1;
-                            dst_row[x3+2] = ((int)row2[sx3+2] + (int)row2[sx3+5]) >> 1;
-                        } else if(wl == -1 && __builtin_expect(sx3 >= 3, 1)) {
-                            dst_row[x3]   = ((int)row2[sx3-3] + (int)row2[sx3])   >> 1;
-                            dst_row[x3+1] = ((int)row2[sx3-2] + (int)row2[sx3+1]) >> 1;
-                            dst_row[x3+2] = ((int)row2[sx3-1] + (int)row2[sx3+2]) >> 1;
-                        } else {
-                            dst_row[x3]   = row2[sx3];
-                            dst_row[x3+1] = row2[sx3+1];
-                            dst_row[x3+2] = row2[sx3+2];
-                        }
+ 
+                    if(wl == 0) {
+                        WR3(dst_row, x3,   RD3(row2, sx3));
+                        WR3(dst_row, x3+1, RD3(row2, sx3+1));
+                        WR3(dst_row, x3+2, RD3(row2, sx3+2));
+                    } else if(mode5) {
+                        const int kh0=kaiser4_lut[wx][0], kh1=kaiser4_lut[wx][1];
+                        const int kh2=kaiser4_lut[wx][2], kh3=kaiser4_lut[wx][3];
+                        int p1,p2,p3,p4;
+                        if(wl==1){p1=(sx3>=3)?sx3-3:sx3;p2=sx3;p3=(sx3+3<in_w3)?sx3+3:sx3;p4=(sx3+6<in_w3)?sx3+6:p3;}
+                        else     {p1=(sx3+3<in_w3)?sx3+3:sx3;p2=sx3;p3=(sx3>=3)?sx3-3:sx3;p4=(sx3>=6)?sx3-6:p3;}
+                        for(int c=0;c<3;c++)
+                            WR3(dst_row, x3+c, (RD3(row2,p1+c)*kh0+RD3(row2,p2+c)*kh1+RD3(row2,p3+c)*kh2+RD3(row2,p4+c)*kh3)>>WEIGHT_SHIFT);
+                    } else if(weighted) {
+                        const int iw=WEIGHT_MAX-wx;
+                        int sx3b=(wl==1)?((sx3+3<in_w3)?sx3+3:sx3):((sx3>=3)?sx3-3:sx3);
+                        for(int c=0;c<3;c++)
+                            WR3(dst_row, x3+c, (RD3(row2,sx3+c)*iw+RD3(row2,sx3b+c)*wx)>>WEIGHT_SHIFT);
+                    } else {
+                        int sx3b=(wl==1)?((sx3+3<in_w3)?sx3+3:sx3):((sx3>=3)?sx3-3:sx3);
+                        for(int c=0;c<3;c++)
+                            WR3(dst_row, x3+c, (RD3(row2,sx3+c)+RD3(row2,sx3b+c))>>1);
                     }
                 }
             }
             else
             {
-                // interpolation verticale active
                 int x3 = 0;
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
@@ -1211,138 +1229,59 @@ void process_files_2d(const unsigned char * restrict in_buf,
                     const int wl  = map->w_flag  [map_w_base + x];
                     const int wx  = map->w_weight[map_w_base + x];
                     const int sx3 = sx * 3;
-
-                    // indices horizontaux précalculés — réutilisés pour les 4 lignes
-                    int p1, p2, p3, p4;
-                    if(wl == 1) {
-                        p1 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
-                        p2 = sx3;
-                        p3 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
-                        p4 = __builtin_expect(sx3 + 6 < in_w3, 1) ? sx3 + 6 : p3;
-                    } else if(wl == -1) {
-                        p1 = __builtin_expect(sx3 + 3 < in_w3, 1) ? sx3 + 3 : sx3;
-                        p2 = sx3;
-                        p3 = __builtin_expect(sx3 >= 3,        1) ? sx3 - 3 : sx3;
-                        p4 = __builtin_expect(sx3 >= 6,        1) ? sx3 - 6 : p3;
+                    int p1,p2,p3,p4;
+                    if(wl==1){p1=(sx3>=3)?sx3-3:sx3;p2=sx3;p3=(sx3+3<in_w3)?sx3+3:sx3;p4=(sx3+6<in_w3)?sx3+6:p3;}
+                    else if(wl==-1){p1=(sx3+3<in_w3)?sx3+3:sx3;p2=sx3;p3=(sx3>=3)?sx3-3:sx3;p4=(sx3>=6)?sx3-6:p3;}
+                    else{p1=p2=p3=p4=sx3;}
+ 
+                    if(wl == 0) {
+                        if(mode5) {
+                            for(int c=0;c<3;c++){
+                                int v=(RD3(row1,sx3+c)*kv0+RD3(row2,sx3+c)*kv1+RD3(row3,sx3+c)*kv2+RD3(row4,sx3+c)*kv3)>>WEIGHT_SHIFT;
+                                WR3(dst_row,x3+c,v);
+                            }
+                        } else if(weighted) {
+                            for(int c=0;c<3;c++)
+                                WR3(dst_row,x3+c,(RD3(row2,sx3+c)*iwy+RD3(row3,sx3+c)*wy)>>WEIGHT_SHIFT);
+                        } else {
+                            for(int c=0;c<3;c++)
+                                WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row3,sx3+c))>>1);
+                        }
                     } else {
-                        p1 = p2 = p3 = p4 = sx3;
-                    }
-
-                    if(wl == 0)
-                    {
-                        // cas 3 : vertical seulement
-                        if(mode5)
-                        {
-                            int v0 = ((int)row1[sx3]  *kv0 + (int)row2[sx3]  *kv1
-                                    + (int)row3[sx3]  *kv2 + (int)row4[sx3]  *kv3) >> WEIGHT_SHIFT;
-                            int v1 = ((int)row1[sx3+1]*kv0 + (int)row2[sx3+1]*kv1
-                                    + (int)row3[sx3+1]*kv2 + (int)row4[sx3+1]*kv3) >> WEIGHT_SHIFT;
-                            int v2 = ((int)row1[sx3+2]*kv0 + (int)row2[sx3+2]*kv1
-                                    + (int)row3[sx3+2]*kv2 + (int)row4[sx3+2]*kv3) >> WEIGHT_SHIFT;
-                            dst_row[x3]   = CLAMP255(v0);
-                            dst_row[x3+1] = CLAMP255(v1);
-                            dst_row[x3+2] = CLAMP255(v2);
-                        }
-                        else if(weighted)
-                        {
-                            dst_row[x3]   = ((int)row2[sx3]  *iwy + (int)row3[sx3]  *wy) >> WEIGHT_SHIFT;
-                            dst_row[x3+1] = ((int)row2[sx3+1]*iwy + (int)row3[sx3+1]*wy) >> WEIGHT_SHIFT;
-                            dst_row[x3+2] = ((int)row2[sx3+2]*iwy + (int)row3[sx3+2]*wy) >> WEIGHT_SHIFT;
-                        }
-                        else
-                        {
-                            dst_row[x3]   = ((int)row2[sx3]   + (int)row3[sx3])   >> 1;
-                            dst_row[x3+1] = ((int)row2[sx3+1] + (int)row3[sx3+1]) >> 1;
-                            dst_row[x3+2] = ((int)row2[sx3+2] + (int)row3[sx3+2]) >> 1;
-                        }
-                    }
-                    else
-                    {
-                        // cas 4 : 2D
-                        if(mode5)
-                        {
-                            const int kh0 = kaiser4_lut[wx][0];
-                            const int kh1 = kaiser4_lut[wx][1];
-                            const int kh2 = kaiser4_lut[wx][2];
-                            const int kh3 = kaiser4_lut[wx][3];
-
-                            // interpolation horizontale sur les 4 lignes,
-                            // indices p1..p4 précalculés une seule fois
-                            int h10 = ((int)row1[p1]  *kh0 + (int)row1[p2]  *kh1
-                                     + (int)row1[p3]  *kh2 + (int)row1[p4]  *kh3) >> WEIGHT_SHIFT;
-                            int h11 = ((int)row1[p1+1]*kh0 + (int)row1[p2+1]*kh1
-                                     + (int)row1[p3+1]*kh2 + (int)row1[p4+1]*kh3) >> WEIGHT_SHIFT;
-                            int h12 = ((int)row1[p1+2]*kh0 + (int)row1[p2+2]*kh1
-                                     + (int)row1[p3+2]*kh2 + (int)row1[p4+2]*kh3) >> WEIGHT_SHIFT;
-
-                            int h20 = ((int)row2[p1]  *kh0 + (int)row2[p2]  *kh1
-                                     + (int)row2[p3]  *kh2 + (int)row2[p4]  *kh3) >> WEIGHT_SHIFT;
-                            int h21 = ((int)row2[p1+1]*kh0 + (int)row2[p2+1]*kh1
-                                     + (int)row2[p3+1]*kh2 + (int)row2[p4+1]*kh3) >> WEIGHT_SHIFT;
-                            int h22 = ((int)row2[p1+2]*kh0 + (int)row2[p2+2]*kh1
-                                     + (int)row2[p3+2]*kh2 + (int)row2[p4+2]*kh3) >> WEIGHT_SHIFT;
-
-                            int h30 = ((int)row3[p1]  *kh0 + (int)row3[p2]  *kh1
-                                     + (int)row3[p3]  *kh2 + (int)row3[p4]  *kh3) >> WEIGHT_SHIFT;
-                            int h31 = ((int)row3[p1+1]*kh0 + (int)row3[p2+1]*kh1
-                                     + (int)row3[p3+1]*kh2 + (int)row3[p4+1]*kh3) >> WEIGHT_SHIFT;
-                            int h32 = ((int)row3[p1+2]*kh0 + (int)row3[p2+2]*kh1
-                                     + (int)row3[p3+2]*kh2 + (int)row3[p4+2]*kh3) >> WEIGHT_SHIFT;
-
-                            int h40 = ((int)row4[p1]  *kh0 + (int)row4[p2]  *kh1
-                                     + (int)row4[p3]  *kh2 + (int)row4[p4]  *kh3) >> WEIGHT_SHIFT;
-                            int h41 = ((int)row4[p1+1]*kh0 + (int)row4[p2+1]*kh1
-                                     + (int)row4[p3+1]*kh2 + (int)row4[p4+1]*kh3) >> WEIGHT_SHIFT;
-                            int h42 = ((int)row4[p1+2]*kh0 + (int)row4[p2+2]*kh1
-                                     + (int)row4[p3+2]*kh2 + (int)row4[p4+2]*kh3) >> WEIGHT_SHIFT;
-
-                            // clamp intermédiaire avant combinaison verticale
-                            h10 = CLAMP255(h10); h11 = CLAMP255(h11); h12 = CLAMP255(h12);
-                            h20 = CLAMP255(h20); h21 = CLAMP255(h21); h22 = CLAMP255(h22);
-                            h30 = CLAMP255(h30); h31 = CLAMP255(h31); h32 = CLAMP255(h32);
-                            h40 = CLAMP255(h40); h41 = CLAMP255(h41); h42 = CLAMP255(h42);
-
-                            // combinaison verticale kaiser
-                            int v0 = (h10*kv0 + h20*kv1 + h30*kv2 + h40*kv3) >> WEIGHT_SHIFT;
-                            int v1 = (h11*kv0 + h21*kv1 + h31*kv2 + h41*kv3) >> WEIGHT_SHIFT;
-                            int v2 = (h12*kv0 + h22*kv1 + h32*kv2 + h42*kv3) >> WEIGHT_SHIFT;
-                            dst_row[x3]   = CLAMP255(v0);
-                            dst_row[x3+1] = CLAMP255(v1);
-                            dst_row[x3+2] = CLAMP255(v2);
-                        }
-                        else if(weighted)
-                        {
-                            const int iw = WEIGHT_MAX - wx;
-                            // interpolation horizontale sur les 2 lignes utiles
-                            int h20 = ((int)row2[sx3]  *iw + (int)row2[p3]  *wx) >> WEIGHT_SHIFT;
-                            int h21 = ((int)row2[sx3+1]*iw + (int)row2[p3+1]*wx) >> WEIGHT_SHIFT;
-                            int h22 = ((int)row2[sx3+2]*iw + (int)row2[p3+2]*wx) >> WEIGHT_SHIFT;
-                            int h30 = ((int)row3[sx3]  *iw + (int)row3[p3]  *wx) >> WEIGHT_SHIFT;
-                            int h31 = ((int)row3[sx3+1]*iw + (int)row3[p3+1]*wx) >> WEIGHT_SHIFT;
-                            int h32 = ((int)row3[sx3+2]*iw + (int)row3[p3+2]*wx) >> WEIGHT_SHIFT;
-                            dst_row[x3]   = (h20*iwy + h30*wy) >> WEIGHT_SHIFT;
-                            dst_row[x3+1] = (h21*iwy + h31*wy) >> WEIGHT_SHIFT;
-                            dst_row[x3+2] = (h22*iwy + h32*wy) >> WEIGHT_SHIFT;
-                        }
-                        else
-                        {
-                            // bilinear 50/50 2D
-                            int h20 = ((int)row2[sx3]   + (int)row2[p3])   >> 1;
-                            int h21 = ((int)row2[sx3+1] + (int)row2[p3+1]) >> 1;
-                            int h22 = ((int)row2[sx3+2] + (int)row2[p3+2]) >> 1;
-                            int h30 = ((int)row3[sx3]   + (int)row3[p3])   >> 1;
-                            int h31 = ((int)row3[sx3+1] + (int)row3[p3+1]) >> 1;
-                            int h32 = ((int)row3[sx3+2] + (int)row3[p3+2]) >> 1;
-                            dst_row[x3]   = (h20 + h30) >> 1;
-                            dst_row[x3+1] = (h21 + h31) >> 1;
-                            dst_row[x3+2] = (h22 + h32) >> 1;
+                        if(mode5) {
+                            const int kh0=kaiser4_lut[wx][0],kh1=kaiser4_lut[wx][1];
+                            const int kh2=kaiser4_lut[wx][2],kh3=kaiser4_lut[wx][3];
+                            for(int c=0;c<3;c++){
+                                int h1=(RD3(row1,p1+c)*kh0+RD3(row1,p2+c)*kh1+RD3(row1,p3+c)*kh2+RD3(row1,p4+c)*kh3)>>WEIGHT_SHIFT;
+                                int h2=(RD3(row2,p1+c)*kh0+RD3(row2,p2+c)*kh1+RD3(row2,p3+c)*kh2+RD3(row2,p4+c)*kh3)>>WEIGHT_SHIFT;
+                                int h3=(RD3(row3,p1+c)*kh0+RD3(row3,p2+c)*kh1+RD3(row3,p3+c)*kh2+RD3(row3,p4+c)*kh3)>>WEIGHT_SHIFT;
+                                int h4=(RD3(row4,p1+c)*kh0+RD3(row4,p2+c)*kh1+RD3(row4,p3+c)*kh2+RD3(row4,p4+c)*kh3)>>WEIGHT_SHIFT;
+                                h1=h1<0?0:h1>65535?65535:h1; h2=h2<0?0:h2>65535?65535:h2;
+                                h3=h3<0?0:h3>65535?65535:h3; h4=h4<0?0:h4>65535?65535:h4;
+                                WR3(dst_row,x3+c,(h1*kv0+h2*kv1+h3*kv2+h4*kv3)>>WEIGHT_SHIFT);
+                            }
+                        } else if(weighted) {
+                            const int iw=WEIGHT_MAX-wx;
+                            for(int c=0;c<3;c++){
+                                int h2=(RD3(row2,sx3+c)*iw+RD3(row2,p3+c)*wx)>>WEIGHT_SHIFT;
+                                int h3=(RD3(row3,sx3+c)*iw+RD3(row3,p3+c)*wx)>>WEIGHT_SHIFT;
+                                WR3(dst_row,x3+c,(h2*iwy+h3*wy)>>WEIGHT_SHIFT);
+                            }
+                        } else {
+                            for(int c=0;c<3;c++){
+                                int h2=(RD3(row2,sx3+c)+RD3(row2,p3+c))>>1;
+                                int h3=(RD3(row3,sx3+c)+RD3(row3,p3+c))>>1;
+                                WR3(dst_row,x3+c,(h2+h3)>>1);
+                            }
                         }
                     }
                 }
             }
         }
-        offset += out_w * out_h * 3;
+        offset += out_w * out_h * 3 * bps_out;
     }
+    #undef RD3
+    #undef WR3
 }
 
 void process_files(const unsigned char * restrict in_buf,
@@ -1350,219 +1289,215 @@ void process_files(const unsigned char * restrict in_buf,
                    unsigned char * restrict blend_buf,
                    unsigned char * restrict out_buf,
                    unsigned char * restrict tmp_buf,
-                   const BresenhamMap *  restrict map,
+                   const BresenhamMap * restrict map,
                    const int *tmp_weights,
-                   const int in_w,const int in_h,const int out_w,const int out_h,const int ratio,const int mode)
+                   const int in_w, const int in_h,
+                   const int out_w, const int out_h,
+                   const int ratio, const int mode,
+                   const int bps_in, const int bps_out)
 {
-	const int in_w3    = in_w * 3;
-	const int out_w3   = out_w * 3;
-	const int in_size  = in_w * in_h * 3;
-	const int bilinear = (mode >= 1 && mode != 5);
-	const int weighted = (mode == 3 || mode == 4);
+    const int in_w3    = in_w * 3;   // en pixels, stride en canaux
+    const int out_w3   = out_w * 3;
+    const int in_size  = in_w * in_h * 3;
+    const int bilinear = (mode >= 1 && mode != 5);
+    const int weighted = (mode == 3 || mode == 4);
+	 
+		#define RD3(ptr, i) \
+			((bps_in == 1) ? ((int)(ptr)[i] << 8) \
+						   : (int)((const uint16_t*)(ptr))[i])
+	 
+		#define WR3(ptr, i, v) do { \
+			int _v = (v); \
+			_v = _v < 0 ? 0 : _v > 65535 ? 65535 : _v; \
+			if(bps_out == 1) (ptr)[i]               = (unsigned char)(_v >> 8); \
+			else ((uint16_t*)(ptr))[i]              = (uint16_t)_v; \
+		} while(0)
+ 
     unsigned int offset = 0;
-    for(int r=0; r<ratio; r++)
+    for(int r = 0; r < ratio; r++)
     {
-        // Blend temporel : si w_r > 0, fusionne in_buf et next_buf dans
-        // blend_buf, et utilise blend_buf comme source du scaling spatial.
-        // Sinon, on travaille directement sur in_buf (zéro copie).
-        // NB : src_buf n'a PAS de restrict car il peut aliaser in_buf
-        // (qui est restrict). Sinon c'est UB et le compilateur produit
-        // des optimisations incorrectes (path mode 2 cassé).
         const int tw = tmp_weights[r];
-        const unsigned char *src_buf;
+        const unsigned char *src_buf_ptr;
         if(tw > 0 && next_buf != in_buf)
         {
             const int itw = WEIGHT_MAX - tw;
-            for(int i = 0; i < in_size; i++)
-                blend_buf[i] = (in_buf[i] * itw + next_buf[i] * tw) >> WEIGHT_SHIFT;
-            src_buf = blend_buf;
+            if(bps_in == 1) {
+                for(int i = 0; i < in_size; i++)
+                    blend_buf[i] = (in_buf[i]*itw + next_buf[i]*tw) >> WEIGHT_SHIFT;
+            } else {
+                const uint16_t *in16   = (const uint16_t *)in_buf;
+                const uint16_t *next16 = (const uint16_t *)next_buf;
+                      uint16_t *bl16   = (uint16_t *)blend_buf;
+                for(int i = 0; i < in_size; i++)
+                    bl16[i] = (in16[i]*itw + next16[i]*tw) >> WEIGHT_SHIFT;
+            }
+            src_buf_ptr = blend_buf;
         }
         else
         {
-            src_buf = in_buf;
+            src_buf_ptr = in_buf;
         }
-
-        //scale the width line by line
-        const int map_w_base = r * out_w;  // hissé hors des boucles
-
-		for(int h=0; h<in_h; h++)
-		{
-			const unsigned char * restrict src_row = src_buf + h * in_w3;
-			unsigned char *dst_row = tmp_buf + h * out_w3;
-		 
-			int px3 = 0;
-			for(int px=0; px<out_w; px++, px3+=3)
-			{
-				const int src_px      = map->w_src [map_w_base + px] * 3;
-				const int is_bilinear = map->w_flag[map_w_base + px];
-		 
-				if(weighted && is_bilinear == 1 && src_px + 3 < in_w3)
-				{
-					const int w  = map->w_weight[map_w_base + px];
-					const int iw = WEIGHT_MAX - w;
-					dst_row[px3]   = (src_row[src_px]   * iw + src_row[src_px+3] * w) >> WEIGHT_SHIFT;
-					dst_row[px3+1] = (src_row[src_px+1] * iw + src_row[src_px+4] * w) >> WEIGHT_SHIFT;
-					dst_row[px3+2] = (src_row[src_px+2] * iw + src_row[src_px+5] * w) >> WEIGHT_SHIFT;
-				}
-				else if(weighted && is_bilinear == -1 && src_px >= 3)
-				{
-					const int w  = map->w_weight[map_w_base + px];
-					const int iw = WEIGHT_MAX - w;
-					dst_row[px3]   = (src_row[src_px]   * iw + src_row[src_px-3] * w) >> WEIGHT_SHIFT;
-					dst_row[px3+1] = (src_row[src_px+1] * iw + src_row[src_px-2] * w) >> WEIGHT_SHIFT;
-					dst_row[px3+2] = (src_row[src_px+2] * iw + src_row[src_px-1] * w) >> WEIGHT_SHIFT;
-				}
-				else if(bilinear && !weighted && is_bilinear == 1 && src_px + 3 < in_w3)
-				{
-					dst_row[px3]   = (src_row[src_px]   + src_row[src_px+3]) >> 1;
-					dst_row[px3+1] = (src_row[src_px+1] + src_row[src_px+4]) >> 1;
-					dst_row[px3+2] = (src_row[src_px+2] + src_row[src_px+5]) >> 1;
-				}
-				else if(bilinear && !weighted && is_bilinear == -1 && src_px >= 3)
-				{
-					dst_row[px3]   = (src_row[src_px-3] + src_row[src_px])   >> 1;
-					dst_row[px3+1] = (src_row[src_px-2] + src_row[src_px+1]) >> 1;
-					dst_row[px3+2] = (src_row[src_px-1] + src_row[src_px+2]) >> 1;
-				}
-				// ---- MODE 5 : kaiser 4 taps ----
-				else if(mode == 5 && is_bilinear != 0)
-				{
-					const int w = map->w_weight[map_w_base + px];
-					if(w == 0)
-					{
-						dst_row[px3]   = src_row[src_px];
-						dst_row[px3+1] = src_row[src_px+1];
-						dst_row[px3+2] = src_row[src_px+2];
-					}
-					else
-					{
-						const int *k = kaiser4_lut[w];
-						int p1, p2, p3, p4;
-		 
-						if(is_bilinear == 1) {
-							p1 = (src_px >= 3)        ? src_px - 3 : src_px;
-							p2 = src_px;
-							p3 = (src_px + 3 < in_w3) ? src_px + 3 : src_px;
-							p4 = (src_px + 6 < in_w3) ? src_px + 6 : p3;  // ← était src_px + 3
-						} else {
-							p1 = (src_px + 3 < in_w3) ? src_px + 3 : src_px;
-							p2 = src_px;
-							p3 = (src_px >= 3)         ? src_px - 3 : src_px;
-							p4 = (src_px >= 6)         ? src_px - 6 : p3;  // ← était src_px - 3
-						}
-		 
-						int v0 = ((int)src_row[p1]*k[0] + (int)src_row[p2]*k[1]
-								+ (int)src_row[p3]*k[2] + (int)src_row[p4]*k[3]) >> WEIGHT_SHIFT;
-						int v1 = ((int)src_row[p1+1]*k[0] + (int)src_row[p2+1]*k[1]
-								+ (int)src_row[p3+1]*k[2] + (int)src_row[p4+1]*k[3]) >> WEIGHT_SHIFT;
-						int v2 = ((int)src_row[p1+2]*k[0] + (int)src_row[p2+2]*k[1]
-								+ (int)src_row[p3+2]*k[2] + (int)src_row[p4+2]*k[3]) >> WEIGHT_SHIFT;
-						dst_row[px3]   = v0 < 0 ? 0 : v0 > 255 ? 255 : v0;
-						dst_row[px3+1] = v1 < 0 ? 0 : v1 > 255 ? 255 : v1;
-						dst_row[px3+2] = v2 < 0 ? 0 : v2 > 255 ? 255 : v2;
-					}
-				}
-				else
-				{
-					dst_row[px3]   = src_row[src_px];
-					dst_row[px3+1] = src_row[src_px+1];
-					dst_row[px3+2] = src_row[src_px+2];
-				}
-			}
-		}
-
-        //scale the height line by line
-		const int map_h_base = r * out_h;
-
-		for(int px=0; px<out_h; px++)
-		{
-			const int src_line    = map->h_src [map_h_base + px];
-			const int is_bilinear = map->h_flag[map_h_base + px];
-		 
-			unsigned char       *dst_row  = out_buf + offset + px * out_w3;
-			const unsigned char * restrict tmp_row0 = tmp_buf + src_line * out_w3;
-		 
-			if(weighted && is_bilinear == 1 && src_line + 1 < in_h)
-			{
-				const int w = map->h_weight[map_h_base + px];
-				if(w == 0) {
-					memcpy(dst_row, tmp_row0, out_w3);
-				} else {
-					const int iw = WEIGHT_MAX - w;
-					const unsigned char * restrict tmp_row1 = tmp_row0 + out_w3;
-					for(int i=0; i<out_w3; i++)
-						dst_row[i] = (tmp_row0[i] * iw + tmp_row1[i] * w) >> WEIGHT_SHIFT;
-				}
-			}
-			else if(weighted && is_bilinear == -1 && src_line >= 1)
-			{
-				const int w = map->h_weight[map_h_base + px];
-				if(w == 0) {
-					memcpy(dst_row, tmp_row0, out_w3);
-				} else {
-					const int iw = WEIGHT_MAX - w;
-					const unsigned char * restrict tmp_row_1 = tmp_row0 - out_w3;
-					for(int i=0; i<out_w3; i++)
-						dst_row[i] = (tmp_row0[i] * iw + tmp_row_1[i] * w) >> WEIGHT_SHIFT;
-				}
-			}
-			else if(bilinear && !weighted && is_bilinear == 1 && src_line + 1 < in_h)
-			{
-				const unsigned char * restrict tmp_row1 = tmp_row0 + out_w3;
-				for(int i=0; i<out_w3; i++)
-					dst_row[i] = (tmp_row0[i] + tmp_row1[i]) >> 1;
-			}
-			else if(bilinear && !weighted && is_bilinear == -1 && src_line >= 1)
-			{
-				const unsigned char *tmp_row_1 = tmp_row0 - out_w3;
-				for(int i=0; i<out_w3; i++)
-					dst_row[i] = (tmp_row_1[i] + tmp_row0[i]) >> 1;
-			}
-			// ---- MODE 5 : kaiser 4 taps ----
-			else if(mode == 5 && is_bilinear != 0)
-			{
-				const int w = map->h_weight[map_h_base + px];
-				if(w == 0)
-				{
-					memcpy(dst_row, tmp_row0, out_w3);
-				}
-				else
-				{
-					const int *k = kaiser4_lut[w];
-					int l1, l2, l3, l4;
-		 
-					if(is_bilinear == 1) {
-						l1 = (src_line >= 1)       ? src_line - 1 : src_line;
-						l2 = src_line;
-						l3 = (src_line + 1 < in_h) ? src_line + 1 : src_line;
-						l4 = (src_line + 2 < in_h) ? src_line + 2 : l3;  // ← était src_line + 1
-					} else {
-						l1 = (src_line + 1 < in_h) ? src_line + 1 : src_line;
-						l2 = src_line;
-						l3 = (src_line >= 1)        ? src_line - 1 : src_line;
-						l4 = (src_line >= 2)        ? src_line - 2 : l3;  // ← était src_line - 1
-					}
-		 
-					const unsigned char *r1 = tmp_buf + l1 * out_w3;
-					const unsigned char *r2 = tmp_buf + l2 * out_w3;
-					const unsigned char *r3 = tmp_buf + l3 * out_w3;
-					const unsigned char *r4 = tmp_buf + l4 * out_w3;
-		 
-					for(int i = 0; i < out_w3; i++) {
-						int v = ((int)r1[i]*k[0] + (int)r2[i]*k[1]
-							   + (int)r3[i]*k[2] + (int)r4[i]*k[3]) >> WEIGHT_SHIFT;
-						dst_row[i] = v < 0 ? 0 : v > 255 ? 255 : v;
-					}
-				}
-			}
-			// ---- FIN MODE 5 ----
-			else
-			{
-				memcpy(dst_row, tmp_row0, out_w3);
-			}
-		}
-        offset += out_w*out_h*3;
+ 
+        const int map_w_base = r * out_w;
+ 
+        for(int h = 0; h < in_h; h++)
+        {
+            const unsigned char *src_row = src_buf_ptr + h * in_w3 * bps_in;
+            unsigned char       *dst_row = tmp_buf     + h * out_w3 * bps_out;
+ 
+            int px3 = 0;
+            for(int px = 0; px < out_w; px++, px3 += 3)
+            {
+                const int src_px      = map->w_src [map_w_base + px] * 3;
+                const int is_bilinear = map->w_flag[map_w_base + px];
+ 
+                if(mode == 5 && is_bilinear != 0)
+                {
+                    const int w = map->w_weight[map_w_base + px];
+                    if(w == 0) {
+                        WR3(dst_row, px3,   RD3(src_row, src_px));
+                        WR3(dst_row, px3+1, RD3(src_row, src_px+1));
+                        WR3(dst_row, px3+2, RD3(src_row, src_px+2));
+                    } else {
+                        const int *k = kaiser4_lut[w];
+                        int p1, p2, p3, p4;
+                        if(is_bilinear == 1) {
+                            p1 = (src_px >= 3)         ? src_px-3 : src_px;
+                            p2 = src_px;
+                            p3 = (src_px+3 < in_w3)    ? src_px+3 : src_px;
+                            p4 = (src_px+6 < in_w3)    ? src_px+6 : p3;
+                        } else {
+                            p1 = (src_px+3 < in_w3)    ? src_px+3 : src_px;
+                            p2 = src_px;
+                            p3 = (src_px >= 3)          ? src_px-3 : src_px;
+                            p4 = (src_px >= 6)          ? src_px-6 : p3;
+                        }
+                        WR3(dst_row, px3,   (RD3(src_row,p1)*k[0]+RD3(src_row,p2)*k[1]+RD3(src_row,p3)*k[2]+RD3(src_row,p4)*k[3]) >> WEIGHT_SHIFT);
+                        WR3(dst_row, px3+1, (RD3(src_row,p1+1)*k[0]+RD3(src_row,p2+1)*k[1]+RD3(src_row,p3+1)*k[2]+RD3(src_row,p4+1)*k[3]) >> WEIGHT_SHIFT);
+                        WR3(dst_row, px3+2, (RD3(src_row,p1+2)*k[0]+RD3(src_row,p2+2)*k[1]+RD3(src_row,p3+2)*k[2]+RD3(src_row,p4+2)*k[3]) >> WEIGHT_SHIFT);
+                    }
+                }
+                else if(weighted && is_bilinear == 1 && src_px+3 < in_w3)
+                {
+                    const int w = map->w_weight[map_w_base + px];
+                    const int iw = WEIGHT_MAX - w;
+                    WR3(dst_row, px3,   (RD3(src_row,src_px)  *iw + RD3(src_row,src_px+3)*w) >> WEIGHT_SHIFT);
+                    WR3(dst_row, px3+1, (RD3(src_row,src_px+1)*iw + RD3(src_row,src_px+4)*w) >> WEIGHT_SHIFT);
+                    WR3(dst_row, px3+2, (RD3(src_row,src_px+2)*iw + RD3(src_row,src_px+5)*w) >> WEIGHT_SHIFT);
+                }
+                else if(weighted && is_bilinear == -1 && src_px >= 3)
+                {
+                    const int w = map->w_weight[map_w_base + px];
+                    const int iw = WEIGHT_MAX - w;
+                    WR3(dst_row, px3,   (RD3(src_row,src_px)  *iw + RD3(src_row,src_px-3)*w) >> WEIGHT_SHIFT);
+                    WR3(dst_row, px3+1, (RD3(src_row,src_px+1)*iw + RD3(src_row,src_px-2)*w) >> WEIGHT_SHIFT);
+                    WR3(dst_row, px3+2, (RD3(src_row,src_px+2)*iw + RD3(src_row,src_px-1)*w) >> WEIGHT_SHIFT);
+                }
+                else if(bilinear && !weighted && is_bilinear == 1 && src_px+3 < in_w3)
+                {
+                    WR3(dst_row, px3,   (RD3(src_row,src_px)   + RD3(src_row,src_px+3)) >> 1);
+                    WR3(dst_row, px3+1, (RD3(src_row,src_px+1) + RD3(src_row,src_px+4)) >> 1);
+                    WR3(dst_row, px3+2, (RD3(src_row,src_px+2) + RD3(src_row,src_px+5)) >> 1);
+                }
+                else if(bilinear && !weighted && is_bilinear == -1 && src_px >= 3)
+                {
+                    WR3(dst_row, px3,   (RD3(src_row,src_px-3) + RD3(src_row,src_px))   >> 1);
+                    WR3(dst_row, px3+1, (RD3(src_row,src_px-2) + RD3(src_row,src_px+1)) >> 1);
+                    WR3(dst_row, px3+2, (RD3(src_row,src_px-1) + RD3(src_row,src_px+2)) >> 1);
+                }
+                else
+                {
+                    WR3(dst_row, px3,   RD3(src_row, src_px));
+                    WR3(dst_row, px3+1, RD3(src_row, src_px+1));
+                    WR3(dst_row, px3+2, RD3(src_row, src_px+2));
+                }
+            }
+        }
+ 
+        const int map_h_base = r * out_h;
+        for(int px = 0; px < out_h; px++)
+        {
+            const int src_line    = map->h_src [map_h_base + px];
+            const int is_bilinear = map->h_flag[map_h_base + px];
+ 
+            unsigned char       *dst_row  = out_buf + offset + px * out_w3 * bps_out;
+            const unsigned char *tmp_row0 = tmp_buf + src_line * out_w3 * bps_out;
+            const int row_bytes = out_w3 * bps_out;
+ 
+            if(mode == 5 && is_bilinear != 0)
+            {
+                const int w = map->h_weight[map_h_base + px];
+                if(w == 0) {
+                    memcpy(dst_row, tmp_row0, row_bytes);
+                } else {
+                    const int *k = kaiser4_lut[w];
+                    int l1, l2, l3, l4;
+                    if(is_bilinear == 1) {
+                        l1 = (src_line >= 1)      ? src_line-1 : src_line;
+                        l2 = src_line;
+                        l3 = (src_line+1 < in_h)  ? src_line+1 : src_line;
+                        l4 = (src_line+2 < in_h)  ? src_line+2 : l3;
+                    } else {
+                        l1 = (src_line+1 < in_h)  ? src_line+1 : src_line;
+                        l2 = src_line;
+                        l3 = (src_line >= 1)       ? src_line-1 : src_line;
+                        l4 = (src_line >= 2)       ? src_line-2 : l3;
+                    }
+                    const unsigned char *r1 = tmp_buf + l1 * row_bytes;
+                    const unsigned char *r2 = tmp_buf + l2 * row_bytes;
+                    const unsigned char *r3 = tmp_buf + l3 * row_bytes;
+                    const unsigned char *r4 = tmp_buf + l4 * row_bytes;
+                    for(int i = 0; i < out_w3; i++) {
+                        int v = (RD3(r1,i)*k[0]+RD3(r2,i)*k[1]+RD3(r3,i)*k[2]+RD3(r4,i)*k[3]) >> WEIGHT_SHIFT;
+                        WR3(dst_row, i, v);
+                    }
+                }
+            }
+            else if(weighted && is_bilinear == 1 && src_line+1 < in_h)
+            {
+                const int w = map->h_weight[map_h_base + px];
+                if(w == 0) {
+                    memcpy(dst_row, tmp_row0, row_bytes);
+                } else {
+                    const int iw = WEIGHT_MAX - w;
+                    const unsigned char *tmp_row1 = tmp_row0 + row_bytes;
+                    for(int i = 0; i < out_w3; i++)
+                        WR3(dst_row, i, (RD3(tmp_row0,i)*iw + RD3(tmp_row1,i)*w) >> WEIGHT_SHIFT);
+                }
+            }
+            else if(weighted && is_bilinear == -1 && src_line >= 1)
+            {
+                const int w = map->h_weight[map_h_base + px];
+                if(w == 0) {
+                    memcpy(dst_row, tmp_row0, row_bytes);
+                } else {
+                    const int iw = WEIGHT_MAX - w;
+                    const unsigned char *tmp_row_1 = tmp_row0 - row_bytes;
+                    for(int i = 0; i < out_w3; i++)
+                        WR3(dst_row, i, (RD3(tmp_row0,i)*iw + RD3(tmp_row_1,i)*w) >> WEIGHT_SHIFT);
+                }
+            }
+            else if(bilinear && !weighted && is_bilinear == 1 && src_line+1 < in_h)
+            {
+                const unsigned char *tmp_row1 = tmp_row0 + row_bytes;
+                for(int i = 0; i < out_w3; i++)
+                    WR3(dst_row, i, (RD3(tmp_row0,i) + RD3(tmp_row1,i)) >> 1);
+            }
+            else if(bilinear && !weighted && is_bilinear == -1 && src_line >= 1)
+            {
+                const unsigned char *tmp_row_1 = tmp_row0 - row_bytes;
+                for(int i = 0; i < out_w3; i++)
+                    WR3(dst_row, i, (RD3(tmp_row_1,i) + RD3(tmp_row0,i)) >> 1);
+            }
+            else
+            {
+                memcpy(dst_row, tmp_row0, row_bytes);
+            }
+        }
+        offset += out_w * out_h * 3 * bps_out;
     }
+    #undef RD3
+    #undef WR3
 }
 
 // Layout mémoire YUV444p dans les buffers existants :
@@ -1585,18 +1520,21 @@ void *worker_loop(void *arg) {
 
         ThreadArgs *a = &w->args;
 
-        const int in_y_size   = a->in_w * a->in_h;
-		const int out_y_size  = a->out_w * a->out_h * a->ratio;
-		 
-		const int uv_in_w  = (a->in_pix_fmt  == PIX_444) ? a->in_w   : a->in_w  / 2;
-		const int uv_in_h  = (a->in_pix_fmt  == PIX_420) ? a->in_h/2 : a->in_h;
-		const int uv_out_w = (a->out_pix_fmt == PIX_444) ? a->out_w  : a->out_w / 2;
-		const int uv_out_h = (a->out_pix_fmt == PIX_420) ? a->out_h/2: a->out_h;
-		 
-		const int in_uv_size  = uv_in_w  * uv_in_h;
-		const int out_uv_size = uv_out_w * uv_out_h * a->ratio;
-		const int tmp_y_size  = a->out_w * a->in_h;
-		const int tmp_uv_size = uv_out_w * uv_in_h;
+        const int uv_in_w  = (a->in_pix_fmt  == PIX_444P || a->in_pix_fmt  == PIX_444P16) ? a->in_w    :
+							 (a->in_pix_fmt  == PIX_411P  || a->in_pix_fmt  == PIX_410P)  ? a->in_w/4  : a->in_w/2;
+		const int uv_in_h  = (a->in_pix_fmt  == PIX_420P  || a->in_pix_fmt  == PIX_420P16) ? a->in_h/2 :
+							 (a->in_pix_fmt  == PIX_410P)                                  ? a->in_h/4 : a->in_h;
+		const int uv_out_w = (a->out_pix_fmt == PIX_444P || a->out_pix_fmt == PIX_444P16) ? a->out_w   :
+							 (a->out_pix_fmt == PIX_411P  || a->out_pix_fmt == PIX_410P)  ? a->out_w/4 : a->out_w/2;
+		const int uv_out_h = (a->out_pix_fmt == PIX_420P  || a->out_pix_fmt == PIX_420P16) ? a->out_h/2 :
+							 (a->out_pix_fmt == PIX_410P)                                  ? a->out_h/4 : a->out_h;
+
+		const int in_y_size   = a->in_w  * a->in_h  * a->bps_in;
+		const int out_y_size  = a->out_w * a->out_h * a->ratio * a->bps_out;
+		const int tmp_y_size  = a->out_w * a->in_h  * a->bps_out;
+		const int in_uv_size  = uv_in_w  * uv_in_h  * a->bps_in;
+		const int out_uv_size = uv_out_w * uv_out_h * a->ratio * a->bps_out;
+		const int tmp_uv_size = uv_out_w * uv_in_h  * a->bps_out;
 
         switch(a->mode_1d) {
 
@@ -1608,12 +1546,17 @@ void *worker_loop(void *arg) {
                             a->out_buf, a->tmp_buf,
                             a->map, a->tmp_weights,
                             a->in_w, a->in_h, a->out_w, a->out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         break;
 
-                    case PIX_444:
-                    case PIX_422:
-                    case PIX_420:
+                    case PIX_444P:
+					case PIX_444P16:
+					case PIX_422P:
+					case PIX_422P16:
+					case PIX_420P:
+					case PIX_420P16:
+					case PIX_411P:
+					case PIX_410P:
                         // Y — toujours pleine résolution
                         process_files_plane(
                             a->in_buf,
@@ -1623,7 +1566,7 @@ void *worker_loop(void *arg) {
                             a->tmp_buf,
                             a->map, a->tmp_weights,
                             a->in_w, a->in_h, a->out_w, a->out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         // U
                         process_files_plane(
                             a->in_buf    + in_y_size,
@@ -1633,7 +1576,7 @@ void *worker_loop(void *arg) {
                             a->tmp_buf   + tmp_y_size,
                             a->map_uv, a->tmp_weights,
                             uv_in_w, uv_in_h, uv_out_w, uv_out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         // V
                         process_files_plane(
                             a->in_buf    + in_y_size + in_uv_size,
@@ -1643,7 +1586,7 @@ void *worker_loop(void *arg) {
                             a->tmp_buf   + tmp_y_size + tmp_uv_size,
                             a->map_uv, a->tmp_weights,
                             uv_in_w, uv_in_h, uv_out_w, uv_out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         break;
 
                     default:
@@ -1659,12 +1602,17 @@ void *worker_loop(void *arg) {
                             a->out_buf, a->tmp_buf,
                             a->map, a->tmp_weights,
                             a->in_w, a->in_h, a->out_w, a->out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         break;
 
-                    case PIX_444:
-                    case PIX_422:
-                    case PIX_420:
+                    case PIX_444P:
+					case PIX_444P16:
+					case PIX_422P:
+					case PIX_422P16:
+					case PIX_420P:
+					case PIX_420P16:
+					case PIX_411P:
+					case PIX_410P:
                         // Y — toujours pleine résolution
                         process_files_2d_plane(
                             a->in_buf,
@@ -1673,7 +1621,7 @@ void *worker_loop(void *arg) {
                             a->out_buf,
                             a->map, a->tmp_weights,
                             a->in_w, a->in_h, a->out_w, a->out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         // U
                         process_files_2d_plane(
                             a->in_buf    + in_y_size,
@@ -1682,7 +1630,7 @@ void *worker_loop(void *arg) {
                             a->out_buf   + out_y_size,
                             a->map_uv, a->tmp_weights,
                             uv_in_w, uv_in_h, uv_out_w, uv_out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         // V
                         process_files_2d_plane(
                             a->in_buf    + in_y_size + in_uv_size,
@@ -1691,7 +1639,7 @@ void *worker_loop(void *arg) {
                             a->out_buf   + out_y_size + out_uv_size,
                             a->map_uv, a->tmp_weights,
                             uv_in_w, uv_in_h, uv_out_w, uv_out_h,
-                            a->ratio, a->mode);
+                            a->ratio, a->mode, a->bps_in, a->bps_out);
                         break;
 
                     default:
@@ -1840,17 +1788,29 @@ int main(int argc, char **argv)
 			mode_1d = 1;
 			break;
 		case 11:
-			if     (strcmp(optarg, "RGB") == 0) in_pix_fmt = PIX_RGB;
-			else if(strcmp(optarg, "444") == 0) in_pix_fmt = PIX_444;
-			else if(strcmp(optarg, "422") == 0) in_pix_fmt = PIX_422;
-			else if(strcmp(optarg, "420") == 0) in_pix_fmt = PIX_420;
+			if     (strcmp(optarg, "rgb24") == 0 || strcmp(optarg, "RGB24") == 0 || strcmp(optarg, "rgb") == 0 || strcmp(optarg, "RGB") == 0) in_pix_fmt = PIX_RGB;
+			else if(strcmp(optarg, "444p") == 0 || strcmp(optarg, "444P") == 0 || strcmp(optarg, "444") == 0) in_pix_fmt = PIX_444P;
+			else if(strcmp(optarg, "422p") == 0 || strcmp(optarg, "422P") == 0 || strcmp(optarg, "422") == 0) in_pix_fmt = PIX_422P;
+			else if(strcmp(optarg, "420p") == 0 || strcmp(optarg, "420P") == 0 || strcmp(optarg, "420") == 0) in_pix_fmt = PIX_420P;
+			else if(strcmp(optarg, "411p") == 0 || strcmp(optarg, "411P") == 0 || strcmp(optarg, "411") == 0) in_pix_fmt = PIX_411P;
+			else if(strcmp(optarg, "410p") == 0 || strcmp(optarg, "410P") == 0 || strcmp(optarg, "410") == 0) in_pix_fmt = PIX_410P;
+			else if(strcmp(optarg, "rgb48") == 0|| strcmp(optarg, "RGB48") == 0) in_pix_fmt = PIX_RGB48;
+			else if(strcmp(optarg, "444p16") == 0 || strcmp(optarg, "444P16") == 0) in_pix_fmt = PIX_444P16;
+			else if(strcmp(optarg, "422p16") == 0 || strcmp(optarg, "422P16") == 0) in_pix_fmt = PIX_422P16;
+			else if(strcmp(optarg, "420p16") == 0 || strcmp(optarg, "420P16") == 0) in_pix_fmt = PIX_420P16;
 			else { fprintf(stderr, "Error: unknown in-pix-fmt '%s'\n", optarg); return -1; }
 			break;
 		case 12:
-			if     (strcmp(optarg, "RGB") == 0) out_pix_fmt = PIX_RGB;
-			else if(strcmp(optarg, "444") == 0) out_pix_fmt = PIX_444;
-			else if(strcmp(optarg, "422") == 0) out_pix_fmt = PIX_422;
-			else if(strcmp(optarg, "420") == 0) out_pix_fmt = PIX_420;
+			if     (strcmp(optarg, "rgb24") == 0 || strcmp(optarg, "RGB24") == 0 || strcmp(optarg, "rgb") == 0 || strcmp(optarg, "RGB") == 0) out_pix_fmt = PIX_RGB;
+			else if(strcmp(optarg, "444p") == 0 || strcmp(optarg, "444P") == 0 || strcmp(optarg, "444") == 0) out_pix_fmt = PIX_444P;
+			else if(strcmp(optarg, "422p") == 0 || strcmp(optarg, "422P") == 0 || strcmp(optarg, "422") == 0) out_pix_fmt = PIX_422P;
+			else if(strcmp(optarg, "420p") == 0 || strcmp(optarg, "420P") == 0 || strcmp(optarg, "420") == 0) out_pix_fmt = PIX_420P;
+			else if(strcmp(optarg, "411p") == 0 || strcmp(optarg, "411P") == 0 || strcmp(optarg, "411") == 0) out_pix_fmt = PIX_411P;
+			else if(strcmp(optarg, "410p") == 0 || strcmp(optarg, "410P") == 0 || strcmp(optarg, "410") == 0) out_pix_fmt = PIX_410P;
+			else if(strcmp(optarg, "rgb48") == 0 || strcmp(optarg, "RGB48") == 0) out_pix_fmt = PIX_RGB48;
+			else if(strcmp(optarg, "444p16") == 0 || strcmp(optarg, "444P16") == 0) out_pix_fmt = PIX_444P16;
+			else if(strcmp(optarg, "422p16") == 0 || strcmp(optarg, "422P16") == 0) out_pix_fmt = PIX_422P16;
+			else if(strcmp(optarg, "420p16") == 0 || strcmp(optarg, "420P16") == 0) out_pix_fmt = PIX_420P16;
 			else { fprintf(stderr, "Error: unknown out-pix-fmt '%s'\n", optarg); return -1; }
 			break;
 		default:
@@ -1908,7 +1868,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(in_pix_fmt == PIX_422 || in_pix_fmt == PIX_420)
+	if(in_pix_fmt == PIX_422P || in_pix_fmt == PIX_420P)
 	{
 		if(in_w % 2 != 0)
 		{
@@ -1916,7 +1876,7 @@ int main(int argc, char **argv)
 			return -1;
 		}
 	}
-	if(in_pix_fmt == PIX_420)
+	if(in_pix_fmt == PIX_420P)
 	{
 		if(in_h % 2 != 0)
 		{
@@ -1924,7 +1884,7 @@ int main(int argc, char **argv)
 			return -1;
 		}
 	}
-	if(out_pix_fmt == PIX_422 || out_pix_fmt == PIX_420)
+	if(out_pix_fmt == PIX_422P || out_pix_fmt == PIX_420P)
 	{
 		if(out_w % 2 != 0)
 		{
@@ -1932,7 +1892,7 @@ int main(int argc, char **argv)
 			return -1;
 		}
 	}
-	if(out_pix_fmt == PIX_420)
+	if(out_pix_fmt == PIX_420P)
 	{
 		if(out_h % 2 != 0)
 		{
@@ -1941,22 +1901,71 @@ int main(int argc, char **argv)
 		}
 	}
 	
-	const int need_map_uv = (in_pix_fmt  != PIX_RGB && out_pix_fmt != PIX_RGB) &&
-								(in_pix_fmt  != PIX_444 || out_pix_fmt != PIX_444);
+	if(in_pix_fmt == PIX_411P || in_pix_fmt == PIX_410P)
+	{
+		if(in_w % 4 != 0)
+		{
+			fprintf(stderr, "Error: in-width must be multiple of 4 for 411/410\n"); return -1;
+		}
+	}
+	if(in_pix_fmt == PIX_410P)
+	{
+		if(in_h % 4 != 0)
+		{
+			fprintf(stderr, "Error: in-height must be multiple of 4 for 410\n"); return -1;
+		}
+	}
+	
+	if(out_pix_fmt == PIX_411P || out_pix_fmt == PIX_410P)
+	{
+		if(out_w % 4 != 0)
+		{
+			fprintf(stderr, "Error: in-width must be multiple of 4 for 411/410\n"); return -1;
+		}
+	}
+	if(out_pix_fmt == PIX_410P)
+	{
+		if(out_h % 4 != 0)
+		{
+			fprintf(stderr, "Error: in-height must be multiple of 4 for 410\n"); return -1;
+		}
+	}
+	
+	const int is_rgb_in  = (in_pix_fmt  == PIX_RGB  || in_pix_fmt  == PIX_RGB48);
+	const int is_rgb_out = (out_pix_fmt == PIX_RGB  || out_pix_fmt == PIX_RGB48);
+	const int is_444_in  = (in_pix_fmt  == PIX_444P || in_pix_fmt  == PIX_444P16);
+	const int is_444_out = (out_pix_fmt == PIX_444P || out_pix_fmt == PIX_444P16);
+	 
+	const int need_map_uv = !is_rgb_in && !is_rgb_out && !(is_444_in && is_444_out);
+	
+	const int bps_in  = (in_pix_fmt  >= PIX_RGB48) ? 2 : 1;
+	const int bps_out = (out_pix_fmt >= PIX_RGB48) ? 2 : 1;
 	
 	if(out_h > in_h && out_w > in_w && in_h > 0 && in_w > 0)
 	{
 		switch(in_pix_fmt) {
-			case PIX_RGB: in_buf_length = in_w * in_h * 3;     break;
-			case PIX_444: in_buf_length = in_w * in_h * 3;     break;
-			case PIX_422: in_buf_length = in_w * in_h * 2;     break;
-			case PIX_420: in_buf_length = in_w * in_h * 3 / 2; break;
+			case PIX_RGB:	 in_buf_length = in_w * in_h * 3;              break;
+			case PIX_RGB48:	 in_buf_length = in_w * in_h * 3 * 2;          break;
+			case PIX_444P:
+			case PIX_444P16: in_buf_length = in_w * in_h * 3 * bps_in;     break;
+			case PIX_422P:
+			case PIX_422P16: in_buf_length = in_w * in_h * 2 * bps_in;     break;
+			case PIX_420P:
+			case PIX_420P16: in_buf_length = in_w * in_h * 3 / 2 * bps_in; break;
+			case PIX_411P:	 in_buf_length = in_w * in_h * 3 / 2;          break;
+			case PIX_410P:   in_buf_length = in_w * in_h * 9 / 8;          break;
 		}
 		switch(out_pix_fmt) {
-			case PIX_RGB: out_buf_length = out_w * out_h * 3     * frames_ratio; break;
-			case PIX_444: out_buf_length = out_w * out_h * 3     * frames_ratio; break;
-			case PIX_422: out_buf_length = out_w * out_h * 2     * frames_ratio; break;
-			case PIX_420: out_buf_length = out_w * out_h * 3 / 2 * frames_ratio; break;
+			case PIX_RGB:	 out_buf_length = out_w * out_h * 3     * frames_ratio;           break;
+			case PIX_RGB48:  out_buf_length = out_w * out_h * 3 * 2 * frames_ratio;           break;
+			case PIX_444P:
+			case PIX_444P16: out_buf_length = out_w * out_h * 3 * bps_out * frames_ratio;     break;
+			case PIX_422P:
+			case PIX_422P16: out_buf_length = out_w * out_h * 2 * bps_out * frames_ratio;     break;
+			case PIX_420P:
+			case PIX_420P16: out_buf_length = out_w * out_h * 3 / 2 * bps_out * frames_ratio; break;
+			case PIX_411P:	 out_buf_length = out_w * out_h * 3 / 2 * frames_ratio;           break;
+			case PIX_410P:   out_buf_length = out_w * out_h * 9 / 8 * frames_ratio;           break;
 		}
 		
 		map.w_length = out_w * frames_ratio;
@@ -1973,10 +1982,14 @@ int main(int argc, char **argv)
 
 		if(need_map_uv)
 		{
-			const int uv_in_w  = (in_pix_fmt  == PIX_444) ? in_w   : in_w  / 2;
-			const int uv_in_h  = (in_pix_fmt  == PIX_420) ? in_h/2 : in_h;
-			const int uv_out_w = (out_pix_fmt == PIX_444) ? out_w  : out_w / 2;
-			const int uv_out_h = (out_pix_fmt == PIX_420) ? out_h/2: out_h;
+			    const int uv_in_w  = (in_pix_fmt  == PIX_444P  || in_pix_fmt  == PIX_444P16) ? in_w    :
+									 (in_pix_fmt  == PIX_411P  || in_pix_fmt  == PIX_410P)   ? in_w/4  : in_w/2;
+				const int uv_in_h  = (in_pix_fmt  == PIX_420P  || in_pix_fmt  == PIX_420P16) ? in_h/2  :
+									 (in_pix_fmt  == PIX_410P)                               ? in_h/4  : in_h;
+				const int uv_out_w = (out_pix_fmt == PIX_444P  || out_pix_fmt == PIX_444P16) ? out_w   :
+									 (out_pix_fmt == PIX_411P  || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
+				const int uv_out_h = (out_pix_fmt == PIX_420P  || out_pix_fmt == PIX_420P16) ? out_h/2 :
+									 (out_pix_fmt == PIX_410P)                               ? out_h/4 : out_h;
 
 			map_uv.w_length = uv_out_w * frames_ratio;
 			map_uv.h_length = uv_out_h * frames_ratio;
@@ -2007,22 +2020,21 @@ int main(int argc, char **argv)
 		{
 			in_buf[t]    = ALIGNED_MALLOC(in_buf_length, 64);
 			out_buf[t]   = ALIGNED_MALLOC(out_buf_length, 64);
-			const int uv_out_w_alloc = (out_pix_fmt == PIX_444) ? out_w  : out_w / 2;
-			const int uv_in_h_alloc  = (in_pix_fmt  == PIX_420) ? in_h/2 : in_h;
-
-			switch(out_pix_fmt) {
+			const int uv_out_w_alloc = (out_pix_fmt == PIX_444P || out_pix_fmt == PIX_444P16) ? out_w  :
+									   (out_pix_fmt == PIX_411P || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
+			const int uv_in_h_alloc  = (in_pix_fmt  == PIX_420P || in_pix_fmt  == PIX_420P16) ? in_h/2 :
+									   (in_pix_fmt  == PIX_410P)                              ? in_h/4 : in_h;
+		 
+			switch(in_pix_fmt) {
 				case PIX_RGB:
-					tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3, 64);
+				case PIX_RGB48:
+					tmp_buf[t] = ALIGNED_MALLOC(out_w * in_h * 3 * bps_out, 64);
 					break;
-				case PIX_444:
-				case PIX_422:
-				case PIX_420:
-					tmp_buf[t] = ALIGNED_MALLOC(
-						out_w * in_h +                        // Y
-						uv_out_w_alloc * uv_in_h_alloc * 2,  // U + V
-						64);
+				default:  // tous les formats planar
+					tmp_buf[t] = ALIGNED_MALLOC((out_w * in_h + uv_out_w_alloc * uv_in_h_alloc * 2)	* bps_out, 64);
 					break;
 			}
+
 			blend_buf[t] = ALIGNED_MALLOC(in_buf_length, 64);
 			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL || blend_buf[t] == NULL)
 				alloc_err = 1;
@@ -2093,10 +2105,14 @@ int main(int argc, char **argv)
 	
 	if(need_map_uv)
 	{
-		const int uv_in_w  = (in_pix_fmt  == PIX_444) ? in_w   : in_w  / 2;
-		const int uv_in_h  = (in_pix_fmt  == PIX_420) ? in_h/2 : in_h;
-		const int uv_out_w = (out_pix_fmt == PIX_444) ? out_w  : out_w / 2;
-		const int uv_out_h = (out_pix_fmt == PIX_420) ? out_h/2: out_h;
+		const int uv_in_w  = (in_pix_fmt  == PIX_444P  || in_pix_fmt  == PIX_444P16) ? in_w    :
+							 (in_pix_fmt  == PIX_411P  || in_pix_fmt  == PIX_410P)   ? in_w/4  : in_w/2;
+		const int uv_in_h  = (in_pix_fmt  == PIX_420P  || in_pix_fmt  == PIX_420P16) ? in_h/2  :
+							 (in_pix_fmt  == PIX_410P)                               ? in_h/4  : in_h;
+		const int uv_out_w = (out_pix_fmt == PIX_444P  || out_pix_fmt == PIX_444P16) ? out_w   :
+							 (out_pix_fmt == PIX_411P  || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
+		const int uv_out_h = (out_pix_fmt == PIX_420P  || out_pix_fmt == PIX_420P16) ? out_h/2 :
+							 (out_pix_fmt == PIX_410P)                               ? out_h/4 : out_h;
 
 		compute_scale_map(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 
@@ -2128,6 +2144,8 @@ int main(int argc, char **argv)
 		args[t].mode_1d     = mode_1d;
 		args[t].in_pix_fmt  = in_pix_fmt;
 		args[t].out_pix_fmt = out_pix_fmt;
+		args[t].bps_in  = (in_pix_fmt  >= PIX_RGB48) ? 2 : 1;
+		args[t].bps_out = (out_pix_fmt >= PIX_RGB48) ? 2 : 1;
 		args[t].map_uv = need_map_uv ? &map_uv : &map;
 	}
 	
@@ -2208,10 +2226,12 @@ int main(int argc, char **argv)
 				}
 				else
 				{
-					const int frame_y_size  = out_w * out_h;
-					const int uv_out_w_f = (out_pix_fmt == PIX_444) ? out_w  : out_w / 2;
-					const int uv_out_h_f = (out_pix_fmt == PIX_420) ? out_h/2: out_h;
-					const int frame_uv_size = uv_out_w_f * uv_out_h_f;
+					const int frame_y_size = out_w * out_h * bps_out;
+					const int uv_out_w_f = (out_pix_fmt == PIX_444P  || out_pix_fmt == PIX_444P16) ? out_w   :
+										   (out_pix_fmt == PIX_411P  || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
+					const int uv_out_h_f = (out_pix_fmt == PIX_420P  || out_pix_fmt == PIX_420P16) ? out_h/2 :
+										   (out_pix_fmt == PIX_410P)                               ? out_h/4 : out_h;
+					const int frame_uv_size = uv_out_w_f * uv_out_h_f * bps_out;
 					const int out_y_plane   = frame_y_size  * frames_ratio;
 					const int out_uv_plane  = frame_uv_size * frames_ratio;
 				 
