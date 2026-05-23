@@ -227,165 +227,154 @@ const char *get_filename_ext(const char *filename) {
     return dot + 1;
 }
 
-// Alternance de phase spatiale par parité.
-//
-// Les phases impaires (r=1,3,5...) inversent leur direction d'interpolation
-// (flag +1 → -1). Cela garantit une alternance systématique gauche/droite
-// entre frames de sortie consécutives, quel que soit le ratio spatial ou
-// temporel.
-//
-// L'ancienne approche par overlap (comparer r avec r-1 et flipper si > 50%)
-// créait des flips isolés dans les cas dégénérés (ex: ratio spatial = ratio
-// temporel = entier), produisant un combing visible. Exemple : fps-ratio=5
-// et scaling x5 → seule la phase 4 était flippée, créant une inversion
-// brutale toutes les 5 frames.
-void adjust_bilinear_phases(BresenhamMap *map, int out_w, int out_h, int ratio)
-{
-    // Phases impaires : déplacer l'interpolation du bout du run vers le
-    // début, avec flag=-1 (blend vers le voisin précédent). Le nombre
-    // de pixels interpolés reste identique à la phase paire correspondante.
+void adjust_phase_direction(BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio) {
+    const int do_w = (out_w * 2 >= in_w * 5);
+    const int do_h = (out_h * 2 >= in_h * 5);
 
-    // axe horizontal
-    for(int r = 1; r < ratio; r += 2)
-    {
-        const int base = r * out_w;
-        int run_start = 0;
-        while(run_start < out_w)
-        {
-            const int src = map->w_src[base + run_start];
-            int run_end = run_start + 1;
-            while(run_end < out_w && map->w_src[base + run_end] == src)
-                run_end++;
+    for (int r = 0; r < ratio; r++) {
+        const int is_odd_frame = (r % 2 == 1);  // Vrai si frame impaire
 
-            const int N = run_end - run_start;
-            int n_interp = 0;
-            for(int i = 0; i < N; i++)
-                if(map->w_flag[base + run_start + i] != 0)
-                    n_interp++;
+        if (do_w) {
+            int base = r * out_w;
+            int px = 0;
+            while (px < out_w) {
+                int src = map->w_src[base + px];
+                int run_start = px;
+                // Détecte la fin du run de duplication (même src)
+                while (px + 1 < out_w && map->w_src[base + px + 1] == src) {
+                    px++;
+                }
+                int run_length = px - run_start + 1;
 
-            for(int i = 0; i < N; i++)
-                map->w_flag[base + run_start + i] = (i < n_interp) ? -1 : 0;
-
-            run_start = run_end;
+                // On ne traite que les runs de duplication (longueur >= 2)
+                if (run_length >= 2) {
+                    int half = run_length / 2;
+                    if (is_odd_frame) {
+                        // Frame impaire : inverse les half premiers pixels du run
+                        for (int i = 0; i < half; i++) {
+                            map->w_flag[base + run_start + i] = -1;
+                        }
+                        for (int i = half; i < run_length; i++) {
+                            map->w_flag[base + run_start + i] = 0;
+                        }
+                    } else {
+                        // Frame paire : met les half derniers pixels du run à 1
+                        for (int i = 0; i < run_length - half; i++) {
+                            map->w_flag[base + run_start + i] = 0;
+                        }
+                        for (int i = run_length - half; i < run_length; i++) {
+                            map->w_flag[base + run_start + i] = 1;
+                        }
+                    }
+                }
+                px++;  // Passe au pixel suivant
+            }
         }
-    }
 
-    // axe vertical
-    for(int r = 1; r < ratio; r += 2)
-    {
-        const int base = r * out_h;
-        int run_start = 0;
-        while(run_start < out_h)
-        {
-            const int src = map->h_src[base + run_start];
-            int run_end = run_start + 1;
-            while(run_end < out_h && map->h_src[base + run_end] == src)
-                run_end++;
+        if (do_h) {
+            int base = r * out_h;
+            int px = 0;
+            while (px < out_h) {
+                int src = map->h_src[base + px];
+                int run_start = px;
+                // Détecte la fin du run de duplication (même src)
+                while (px + 1 < out_h && map->h_src[base + px + 1] == src) {
+                    px++;
+                }
+                int run_length = px - run_start + 1;
 
-            const int N = run_end - run_start;
-            int n_interp = 0;
-            for(int i = 0; i < N; i++)
-                if(map->h_flag[base + run_start + i] != 0)
-                    n_interp++;
-
-            for(int i = 0; i < N; i++)
-                map->h_flag[base + run_start + i] = (i < n_interp) ? -1 : 0;
-
-            run_start = run_end;
+                // On ne traite que les runs de duplication (longueur >= 2)
+                if (run_length >= 2) {
+                    int half = run_length / 2;
+                    if (is_odd_frame) {
+                        // Frame impaire : inverse les half premiers pixels du run
+                        for (int i = 0; i < half; i++) {
+                            map->h_flag[base + run_start + i] = -1;
+                        }
+                        for (int i = half; i < run_length; i++) {
+                            map->h_flag[base + run_start + i] = 0;
+                        }
+                    } else {
+                        // Frame paire : met les half derniers pixels du run à 1
+                        for (int i = 0; i < run_length - half; i++) {
+                            map->h_flag[base + run_start + i] = 0;
+                        }
+                        for (int i = run_length - half; i < run_length; i++) {
+                            map->h_flag[base + run_start + i] = 1;
+                        }
+                    }
+                }
+                px++;  // Passe au pixel suivant
+            }
         }
     }
 }
 
-// Variante de adjust_bilinear_phases pour les modes 3/4 :
-// le critère de chevauchement utilise w_heavy/h_heavy (pixels dans la
-// moitié haute du run, ie. ceux fortement interpolés) au lieu de w_flag.
-// On veut basculer la direction quand les "vraies" interpolations s'alignent
-// entre phases consécutives, pas quand les pixels juste légèrement
-// interpolés s'alignent (sinon on flip presque toujours).
-void adjust_bilinear_phases_weighted(BresenhamMap *map, int out_w, int out_h, int ratio)
+void adjust_phase_direction_weighted(BresenhamMap *map, int in_w, int in_h, int out_w, int out_h, int ratio)
 {
-    // axe horizontal
+    const int do_w = (out_w * 2 >= in_w * 5);
+    const int do_h = (out_h * 2 >= in_h * 5);
+
     for(int r = 1; r < ratio; r += 2)
     {
-        const int base = r * out_w;
-        int run_start = 0;
-        while(run_start < out_w)
+        if(do_w)
         {
-            const int src = map->w_src[base + run_start];
-            int run_end = run_start + 1;
-            while(run_end < out_w && map->w_src[base + run_end] == src)
-                run_end++;
-
-            const int N = run_end - run_start;
-
-            if(N == 1)
+            int base = r * out_w;
+            int px = 0;
+            while(px < out_w)
             {
-                // Run d'un seul pixel : juste flipper la direction
-                if(map->w_flag[base + run_start] == 1)
-                    map->w_flag[base + run_start] = -1;
-            }
-            else
-            {
-                // Sauvegarder les poids/heavy originaux
-                int tmp_w[N], tmp_h[N];
-                for(int i = 0; i < N; i++)
-                {
-                    tmp_w[i] = map->w_weight[base + run_start + i];
-                    tmp_h[i] = map->w_heavy [base + run_start + i];
-                }
+                int src = map->w_src[base + px];
+                int run_end = px + 1;
+                while(run_end < out_w && map->w_src[base + run_end] == src)
+                    run_end++;
 
-                // Miroiter : le dernier poids va au premier, etc.
-                for(int i = 0; i < N; i++)
+                const int N = run_end - px;
+                if(N > 1)
                 {
-                    int mi = N - 1 - i;
-                    map->w_weight[base + run_start + i] = tmp_w[mi];
-                    map->w_heavy [base + run_start + i] = tmp_h[mi];
-                    map->w_flag  [base + run_start + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                    int tmp_w[N], tmp_h[N];
+                    for(int i = 0; i < N; i++) {
+                        tmp_w[i] = map->w_weight[base + px + i];
+                        tmp_h[i] = map->w_heavy [base + px + i];
+                    }
+                    for(int i = 0; i < N; i++) {
+                        int mi = N - 1 - i;
+                        map->w_weight[base + px + i] = tmp_w[mi];
+                        map->w_heavy [base + px + i] = tmp_h[mi];
+                        map->w_flag  [base + px + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                    }
                 }
+                px = run_end;
             }
-
-            run_start = run_end;
         }
-    }
 
-    // axe vertical
-    for(int r = 1; r < ratio; r += 2)
-    {
-        const int base = r * out_h;
-        int run_start = 0;
-        while(run_start < out_h)
+        if(do_h)
         {
-            const int src = map->h_src[base + run_start];
-            int run_end = run_start + 1;
-            while(run_end < out_h && map->h_src[base + run_end] == src)
-                run_end++;
-
-            const int N = run_end - run_start;
-
-            if(N == 1)
+            int base = r * out_h;
+            int px = 0;
+            while(px < out_h)
             {
-                if(map->h_flag[base + run_start] == 1)
-                    map->h_flag[base + run_start] = -1;
-            }
-            else
-            {
-                int tmp_w[N], tmp_h[N];
-                for(int i = 0; i < N; i++)
-                {
-                    tmp_w[i] = map->h_weight[base + run_start + i];
-                    tmp_h[i] = map->h_heavy [base + run_start + i];
-                }
+                int src = map->h_src[base + px];
+                int run_end = px + 1;
+                while(run_end < out_h && map->h_src[base + run_end] == src)
+                    run_end++;
 
-                for(int i = 0; i < N; i++)
+                const int N = run_end - px;
+                if(N > 1)
                 {
-                    int mi = N - 1 - i;
-                    map->h_weight[base + run_start + i] = tmp_w[mi];
-                    map->h_heavy [base + run_start + i] = tmp_h[mi];
-                    map->h_flag  [base + run_start + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                    int tmp_w[N], tmp_h[N];
+                    for(int i = 0; i < N; i++) {
+                        tmp_w[i] = map->h_weight[base + px + i];
+                        tmp_h[i] = map->h_heavy [base + px + i];
+                    }
+                    for(int i = 0; i < N; i++) {
+                        int mi = N - 1 - i;
+                        map->h_weight[base + px + i] = tmp_w[mi];
+                        map->h_heavy [base + px + i] = tmp_h[mi];
+                        map->h_flag  [base + px + i] = (tmp_w[mi] > 0) ? -1 : 0;
+                    }
                 }
+                px = run_end;
             }
-
-            run_start = run_end;
         }
     }
 }
@@ -394,14 +383,15 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
 {
     for(int r = 0; r < ratio; r++)
     {
-        int err = (r * in_w) / ratio;  // phase en unités source, pas dest
+        int err = (int)(((long long)(2*r + 1) * out_w) / (2 * ratio));
+        if(err >= out_w) err -= out_w;
         int src = 0;
         int dst = r * out_w;
         for(int px = 0; px < out_w; px++)
         {
-			map->w_src[dst]  = src;
-			map->w_flag[dst] = (err > out_w / 2) ? 1 : 0;
-			dst++;
+            map->w_src [dst] = (src < in_w) ? src : in_w - 1;
+            map->w_flag[dst] = (2 * err >= out_w) ? 1 : 0;
+            dst++;
             err += in_w;
             if(err >= out_w) { err -= out_w; src++; }
         }
@@ -409,14 +399,15 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
 
     for(int r = 0; r < ratio; r++)
     {
-        int err = (r * in_h) / ratio;
+        int err = (int)(((long long)(2*r + 1) * out_h) / (2 * ratio));
+        if(err >= out_h) err -= out_h;
         int src = 0;
         int dst = r * out_h;
         for(int px = 0; px < out_h; px++)
         {
-            map->h_src[dst]  = src;
-			map->h_flag[dst] = (err > out_h / 2) ? 1 : 0;
-			dst++;
+            map->h_src [dst] = (src < in_h) ? src : in_h - 1;
+            map->h_flag[dst] = (2 * err >= out_h) ? 1 : 0;  // h_flag pas w_flag
+            dst++;
             err += in_h;
             if(err >= out_h) { err -= out_h; src++; }
         }
@@ -510,7 +501,7 @@ void compute_temporal_weights(int *tmp_weights, int ratio, TmpMode mode, double 
 // On marque w_heavy/h_heavy = 1 pour les floor(N/2) pixels du run qui
 // portent les poids les plus forts (les derniers indices, par construction
 // monotone croissante de la courbe). C'est le critère utilisé par
-// adjust_bilinear_phases_weighted pour décider d'inverser la direction.
+// adjust_phase_direction_weighted pour décider d'inverser la direction.
 //
 // Heavy par run (i >= ceil(N/2), donc floor(N/2) pixels) :
 //   N=2 : i=1                (1 pixel)
@@ -2081,25 +2072,46 @@ int main(int argc, char **argv)
 	//compute the maping used for scaling the input image into an output one
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	
+	for(int r = 0; r < frames_ratio; r++) {
+		fprintf(stderr, "phase %d w_src : ", r);
+		for(int px = 0; px < 16; px++)
+			fprintf(stderr, "%d ", map.w_src[r * out_w + px]);
+		fprintf(stderr, "\n");
+
+		fprintf(stderr, "phase %d w_flag: ", r);
+		for(int px = 0; px < 16; px++)
+			fprintf(stderr, "%d ", map.w_flag[r * out_w + px]);
+		fprintf(stderr, "\n");
+	}
+	
 	if(mode == 3)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_LINEAR, curve_base);
-		adjust_bilinear_phases_weighted(&map, out_w, out_h, frames_ratio);
+		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	}
 	else if(mode == 4)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
-		adjust_bilinear_phases_weighted(&map, out_w, out_h, frames_ratio);
+		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	}
 	else if(mode == 2)
 	{
-		adjust_bilinear_phases(&map, out_w, out_h, frames_ratio);
+		adjust_phase_direction(&map, in_w, in_h, out_w, out_h, frames_ratio);
+		for(int r = 0; r < frames_ratio; r++) {
+			int cw = 0, ch = 0;
+			for(int px = 0; px < out_w; px++)
+				if(map.w_flag[r * out_w + px] != 0) cw++;
+			for(int px = 0; px < out_h; px++)
+				if(map.h_flag[r * out_h + px] != 0) ch++;
+			fprintf(stderr, "phase %d: w=%d/%d (%.1f%%)  h=%d/%d (%.1f%%)\n",
+					r, cw, out_w, 100.0*cw/out_w, ch, out_h, 100.0*ch/out_h);
+		}
 	}
 	// --- 4b. init map + LUT (après les blocs mode 2/3/4 existants) ---
 	else if(mode == 5)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
-		adjust_bilinear_phases_weighted(&map, out_w, out_h, frames_ratio);
+		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_kaiser4_lut(kaiser_beta);
 	}
 	
@@ -2118,12 +2130,12 @@ int main(int argc, char **argv)
 
 		if(mode == 3) {
 			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_LINEAR, curve_base);
-			adjust_bilinear_phases_weighted(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+			adjust_phase_direction_weighted(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 		} else if(mode == 4 || mode == 5) {
 			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
-			adjust_bilinear_phases_weighted(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+			adjust_phase_direction_weighted(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 		} else if(mode == 2) {
-			adjust_bilinear_phases(&map_uv, uv_out_w, uv_out_h, frames_ratio);
+			adjust_phase_direction_weighted(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 		}
 	}
 
