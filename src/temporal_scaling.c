@@ -343,6 +343,11 @@ void adjust_phase_direction_weighted(BresenhamMap *map, int in_w, int in_h, int 
                         map->w_flag  [base + px + i] = (tmp_w[mi] > 0) ? -1 : 0;
                     }
                 }
+				else  // N == 1 : pixel isolé dans une phase impaire
+				{
+					if(map->w_weight[base + px] > 0)
+						map->w_flag[base + px] = -1;
+				}
                 px = run_end;
             }
         }
@@ -373,6 +378,11 @@ void adjust_phase_direction_weighted(BresenhamMap *map, int in_w, int in_h, int 
                         map->h_flag  [base + px + i] = (tmp_w[mi] > 0) ? -1 : 0;
                     }
                 }
+				else  // N == 1
+				{
+					if(map->h_weight[base + px] > 0)
+						map->h_flag[base + px] = -1;
+				}
                 px = run_end;
             }
         }
