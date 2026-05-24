@@ -60,12 +60,14 @@ struct BresenhamMap {
     int *w_flag;    // -1, 0, +1 : direction d'interpolation
     int *w_weight;  // 0..WEIGHT_MAX : poids du voisin (mode 3)
     int *w_heavy;   // 0/1 : pixel dans la moitié haute du run (mode 3)
+	int *w_frac;
+	int *w_pos;   // position continue src*WEIGHT_MAX + frac, pour 2D isotrope
     int *h_src;
     int *h_flag;
     int *h_weight;
     int *h_heavy;
-	int *w_frac;
 	int *h_frac;
+	int *h_pos;
     int w_length;
     int h_length;
 };
@@ -194,20 +196,52 @@ static int kaiser_rad_lut[KAISER_RAD_SIZE];
 // Calcule kaiser_sinc(r, lobes=2, beta) pour r dans [0 .. sqrt(2)*2],
 // indexé par r * WEIGHT_MAX (entier).
 // Même beta que compute_kaiser4_lut, appelée en même temps.
-void compute_kaiser_rad_lut(double beta)
+void compute_kaiser_rad_lut(double beta, double base)
 {
-    const double radius = 2.0;
-    const double inv_i0 = 1.0 / bessel_i0(beta);
+    const double radius  = 2.0;
+    const double inv_i0  = 1.0 / bessel_i0(beta);
+    // courbe exponentielle sur [0..radius] : 1 à r=0, 0 à r=radius
+    // toujours positive, jamais nulle avant radius
+    const double denom   = pow(base, radius) - 1.0;
+
     for(int ri = 0; ri < KAISER_RAD_SIZE; ri++)
     {
         double r = (double)ri / (double)WEIGHT_MAX;
         if(r >= radius) {
             kaiser_rad_lut[ri] = 0;
         } else {
-            double v = bessel_i0(beta * sqrt(1.0 - (r/radius)*(r/radius))) * inv_i0;
-            int vi = (int)(v * (double)WEIGHT_MAX + 0.5);
+            double k     = bessel_i0(beta * sqrt(1.0 - (r/radius)*(r/radius))) * inv_i0;
+            double curve = (pow(base, radius - r) - 1.0) / denom;
+            int vi = (int)(k * curve * (double)WEIGHT_MAX + 0.5);
             kaiser_rad_lut[ri] = vi < 0 ? 0 : vi;
         }
+    }
+}
+
+#define CURVE_RAD_SIZE (3 * WEIGHT_MAX + 1)
+static int curve_rad_lut[CURVE_RAD_SIZE];
+
+void compute_curve_rad_lut(int mode, double base)
+{
+    const double radius = 2.0;
+    // dénominateur pour que la courbe aille de 1 à 0 sur [0..radius]
+    const double denom_exp = pow(base, radius) - 1.0;
+
+    for(int ri = 0; ri < CURVE_RAD_SIZE; ri++)
+    {
+        double r = (double)ri / (double)WEIGHT_MAX;
+        double v;
+        if(r >= radius) {
+            v = 0.0;
+        } else if(mode == 3) {
+            // linéaire : 1 à r=0, 0 à r=radius
+            v = 1.0 - r / radius;
+        } else {
+            // exponentiel : même formule que kaiser_rad_lut
+            v = (pow(base, radius - r) - 1.0) / denom_exp;
+        }
+        int vi = (int)(v * (double)WEIGHT_MAX + 0.5);
+        curve_rad_lut[ri] = vi < 0 ? 0 : vi;
     }
 }
 
@@ -430,6 +464,7 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
             map->w_src [dst] = (src < in_w) ? src : in_w - 1;
             map->w_flag[dst] = (2 * err >= out_w) ? 1 : 0;
             map->w_frac[dst] = (err * WEIGHT_MAX) / out_w;
+			map->w_pos[dst] = src * WEIGHT_MAX + (err * WEIGHT_MAX) / out_w;
             dst++;
             err += in_w;
             if(err >= out_w) { err -= out_w; src++; }
@@ -447,6 +482,7 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
             map->h_src [dst] = (src < in_h) ? src : in_h - 1;
             map->h_flag[dst] = (2 * err >= out_h) ? 1 : 0;
             map->h_frac[dst] = (err * WEIGHT_MAX) / out_h;
+			map->h_pos[dst] = src * WEIGHT_MAX + (err * WEIGHT_MAX) / out_h;
             dst++;
             err += in_h;
             if(err >= out_h) { err -= out_h; src++; }
@@ -939,31 +975,31 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
  
         for(int y = 0; y < out_h; y++)
         {
-            const int sy = map->h_src   [map_h_base + y];
-            const int hl = map->h_flag  [map_h_base + y];
-            const int wy = map->h_weight[map_h_base + y];
- 
-            uint16_t       *dst16    = (uint16_t *)(out_plane + offset + y * out_w * bps_out);
-            unsigned char  *dst_row_8 = out_plane + offset + y * out_w * bps_out;
- 
-            int sy_v = sy;
-            if(hl ==  1) sy_v = (sy + 1 < in_h) ? sy + 1 : sy;
-            if(hl == -1) sy_v = (sy - 1 >= 0)   ? sy - 1 : sy;
- 
-            const unsigned char *row2_8  = src_plane + sy   * in_w * bps_in;
-            const unsigned char *rowV_8  = src_plane + sy_v * in_w * bps_in;
+            int sy, fy;
+            if(weighted || mode5) {
+                const int hpos = map->h_pos[map_h_base + y];
+                sy = hpos / WEIGHT_MAX;
+                fy = hpos % WEIGHT_MAX;
+            } else {
+                sy = map->h_src [map_h_base + y];
+                fy = 0;
+            }
+            const int hl = map->h_flag[map_h_base + y];
+
+            uint16_t      *dst16     = (uint16_t *)(out_plane + offset + y * out_w * bps_out);
+            unsigned char *dst_row_8 =               out_plane + offset + y * out_w * bps_out;
+
+            const unsigned char *row2_8  = src_plane + sy * in_w * bps_in;
             const uint16_t      *row2_16 = (const uint16_t *)row2_8;
-            const uint16_t      *rowV_16 = (const uint16_t *)rowV_8;
- 
+
             if(mode5)
             {
-                const int fy = map->h_frac[map_h_base + y];
- 
                 for(int x = 0; x < out_w; x++)
                 {
-                    const int sx = map->w_src  [map_w_base + x];
-                    const int fx = map->w_frac [map_w_base + x];
- 
+                    const int wpos = map->w_pos[map_w_base + x];
+                    const int sx   = wpos / WEIGHT_MAX;
+                    const int fx   = wpos % WEIGHT_MAX;
+
                     int acc = 0, wsum = 0;
                     for(int dj = -1; dj <= 2; dj++)
                     {
@@ -987,38 +1023,57 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                             wsum += w;
                         }
                     }
-                    if(wsum > 0) WR(x, acc / wsum);
+                    if(wsum > 0) WR(x, (acc + wsum/2) / wsum);
                     else         WR(x, RD(row2, sx));
                 }
             }
             else if(weighted)
             {
-                // modes 3/4 : bilinéaire 2x2 avec wx/wy
-                const int iwy = WEIGHT_MAX - wy;
- 
                 for(int x = 0; x < out_w; x++)
                 {
-                    const int sx  = map->w_src   [map_w_base + x];
-                    const int wl  = map->w_flag  [map_w_base + x];
-                    const int wx  = map->w_weight[map_w_base + x];
-                    const int sx_b = (wl == 1) ? (sx+1 < in_w ? sx+1 : sx)
-                                   : (wl ==-1) ? (sx-1 >= 0   ? sx-1 : sx)
-                                               : sx;
-                    const int iw = WEIGHT_MAX - wx;
-                    const int w00 = (iw * iwy) >> WEIGHT_SHIFT;
-                    const int w10 = (wx * iwy) >> WEIGHT_SHIFT;
-                    const int w01 = (iw * wy ) >> WEIGHT_SHIFT;
-                    const int w11 = (wx * wy ) >> WEIGHT_SHIFT;
-                    WR(x, (RD(row2, sx  )*w00 + RD(row2, sx_b)*w10
-                         + RD(rowV, sx  )*w01 + RD(rowV, sx_b)*w11) >> WEIGHT_SHIFT);
+                    const int wpos   = map->w_pos[map_w_base + x];
+                    const int sx     = wpos / WEIGHT_MAX;
+                    const int wl     = map->w_flag[map_w_base + x];
+                    const int fx     = wpos % WEIGHT_MAX;
+                    const int fx_eff = (wl == -1 || (wl == 0 && (r % 2 == 1)))
+                                       ? (WEIGHT_MAX - fx) : fx;
+
+                    int acc = 0, wsum = 0;
+                    for(int dj = -1; dj <= 2; dj++)
+                    {
+                        int ly = sy + dj;
+                        if(ly < 0) ly = 0;
+                        if(ly >= in_h) ly = in_h - 1;
+                        const unsigned char *rowJ_8  = src_plane + ly * in_w * bps_in;
+                        const uint16_t      *rowJ_16 = (const uint16_t *)rowJ_8;
+                        for(int di = -1; di <= 2; di++)
+                        {
+                            int lx = sx + di;
+                            if(lx < 0) lx = 0;
+                            if(lx >= in_w) lx = in_w - 1;
+                            float dxf = (float)fx / WEIGHT_MAX - di;
+							float dyf = (float)fy / WEIGHT_MAX - dj;
+                            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
+                            if(ri >= CURVE_RAD_SIZE) continue;
+                            int w = curve_rad_lut[ri];
+                            if(w <= 0) continue;
+                            acc  += RD(rowJ, lx) * w;
+                            wsum += w;
+                        }
+                    }
+                    if(wsum > 0) WR(x, (acc + wsum/2) / wsum);
+                    else         WR(x, RD(row2, sx));
                 }
             }
             else
             {
-                // modes 0/1/2 : logique avec branchement hl (inchangée)
-                const unsigned char *row3_8  = src_plane + sy_v * in_w * bps_in;
+                // modes 0/1/2 : inchangé
+                int sy_v2 = sy;
+                if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
+                if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
+                const unsigned char *row3_8  = src_plane + sy_v2 * in_w * bps_in;
                 const uint16_t      *row3_16 = (const uint16_t *)row3_8;
- 
+
                 if(hl == 0)
                 {
                     for(int x = 0; x < out_w; x++)
@@ -1038,8 +1093,8 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                 {
                     for(int x = 0; x < out_w; x++)
                     {
-                        const int sx  = map->w_src [map_w_base + x];
-                        const int wl  = map->w_flag[map_w_base + x];
+                        const int sx   = map->w_src [map_w_base + x];
+                        const int wl   = map->w_flag[map_w_base + x];
                         const int sx_b = (wl == 1) ? (sx+1<in_w?sx+1:sx)
                                        : (wl ==-1) ? (sx-1>=0  ?sx-1:sx)
                                                    : sx;
@@ -1123,34 +1178,31 @@ void process_files_2d(const unsigned char * restrict in_buf,
  
         for(int y = 0; y < out_h; y++)
         {
-            const int sy = map->h_src   [map_h_base + y];
-            const int hl = map->h_flag  [map_h_base + y];
-            const int wy = map->h_weight[map_h_base + y];
- 
+            // sy/fy : position continue pour modes 3/4/5, discrete pour 0/1/2
+            int sy, fy;
+            if(weighted || mode5) {
+                const int hpos = map->h_pos[map_h_base + y];
+                sy = hpos / WEIGHT_MAX;
+                fy = hpos % WEIGHT_MAX;
+            } else {
+                sy = map->h_src [map_h_base + y];
+                fy = 0;
+            }
+            const int hl = map->h_flag[map_h_base + y];
+
             unsigned char *dst_row = out_buf + offset + y * out_w3 * bps_out;
- 
-            // voisin vertical selon hl — commun à tous les modes
-            int sy_v = sy;
-            if(hl ==  1) sy_v = (sy + 1 < in_h) ? sy + 1 : sy;
-            if(hl == -1) sy_v = (sy - 1 >= 0)   ? sy - 1 : sy;
- 
-            const unsigned char *row2 = src_buf_ptr + sy   * in_w3 * bps_in;
-            const unsigned char *rowV = src_buf_ptr + sy_v * in_w3 * bps_in;
- 
+
+            const unsigned char *row2 = src_buf_ptr + sy * in_w3 * bps_in;
+
             if(mode5)
             {
-                // mode 5 : 4x4 kaiser radial isotrope
-                // fx/fy depuis w_frac/h_frac — position continue dans l'espace source
-                // Pas affecté par l'inversion de direction car on utilise
-                // la distance euclidienne au tap, pas la direction
-                const int fy = map->h_frac[map_h_base + y];
- 
                 int x3 = 0;
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
-                    const int sx = map->w_src  [map_w_base + x];
-                    const int fx = map->w_frac [map_w_base + x];
- 
+                    const int wpos = map->w_pos[map_w_base + x];
+                    const int sx   = wpos / WEIGHT_MAX;
+                    const int fx   = wpos % WEIGHT_MAX;
+
                     int acc[3] = {0,0,0}, wsum = 0;
                     for(int dj = -1; dj <= 2; dj++)
                     {
@@ -1175,7 +1227,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
                         }
                     }
                     if(wsum > 0)
-                        for(int c = 0; c < 3; c++) WR3(dst_row, x3+c, acc[c] / wsum);
+						for(int c = 0; c < 3; c++) WR3(dst_row, x3+c, (acc[c] + wsum/2) / wsum);
                     else {
                         const int sx3 = sx * 3;
                         WR3(dst_row, x3,   RD3(row2, sx3));
@@ -1185,54 +1237,63 @@ void process_files_2d(const unsigned char * restrict in_buf,
                 }
             }
             else if(weighted)
-            {
-                // modes 3/4 : bilinéaire 2x2 unifié avec wx/wy
-                // wx et wy sont déjà correctement ajustés par adjust_phase_direction_weighted
-                // wy==0 quand hl==0 (par compute_curve_weights) → pas de frontière
-                const int iwy = WEIGHT_MAX - wy;
- 
-                int x3 = 0;
-                for(int x = 0; x < out_w; x++, x3 += 3)
-                {
-                    const int sx  = map->w_src   [map_w_base + x];
-                    const int wl  = map->w_flag  [map_w_base + x];
-                    const int wx  = map->w_weight[map_w_base + x];
-                    const int sx3 = sx * 3;
- 
-                    // voisin horizontal selon wl (sx3 si wl==0)
-                    const int sx3b = (wl == 1) ? (sx3+3 < in_w3 ? sx3+3 : sx3)
-                                   : (wl ==-1) ? (sx3-3 >= 0    ? sx3-3 : sx3)
-                                               : sx3;
-                    const int iw = WEIGHT_MAX - wx;
- 
-                    // produit 2D des poids : somme garantie = WEIGHT_MAX
-                    const int w00 = (iw * iwy) >> WEIGHT_SHIFT;
-                    const int w10 = (wx * iwy) >> WEIGHT_SHIFT;
-                    const int w01 = (iw * wy ) >> WEIGHT_SHIFT;
-                    const int w11 = (wx * wy ) >> WEIGHT_SHIFT;
- 
-                    for(int c = 0; c < 3; c++) {
-                        int v = (RD3(row2, sx3 +c)*w00 + RD3(row2, sx3b+c)*w10
-                               + RD3(rowV, sx3 +c)*w01 + RD3(rowV, sx3b+c)*w11)
-                                >> WEIGHT_SHIFT;
-                        WR3(dst_row, x3+c, v);
-                    }
-                }
-            }
+			{
+				// modes 3/4 : 4x4 isotrope avec curve_rad_lut
+				// même structure que mode5 mais LUT différente
+				const int fy = map->h_frac[map_h_base + y];  // gardé pour la direction
+
+				int x3 = 0;
+				for(int x = 0; x < out_w; x++, x3 += 3)
+				{
+					const int wpos = map->w_pos[map_w_base + x];
+					const int sx   = wpos / WEIGHT_MAX;
+					const int wl   = map->w_flag[map_w_base + x];
+					const int fx   = wpos % WEIGHT_MAX;
+					const int fx_eff = (wl == -1 || (wl == 0 && (r % 2 == 1)))
+									   ? (WEIGHT_MAX - fx) : fx;
+
+					int acc[3] = {0,0,0}, wsum = 0;
+					for(int dj = -1; dj <= 2; dj++)
+					{
+						int ly = sy + dj;
+						if(ly < 0) ly = 0;
+						if(ly >= in_h) ly = in_h - 1;
+						const unsigned char *rowJ = src_buf_ptr + ly * in_w3 * bps_in;
+						for(int di = -1; di <= 2; di++)
+						{
+							int lx = sx + di;
+							if(lx < 0) lx = 0;
+							if(lx >= in_w) lx = in_w - 1;
+							float dxf = (float)fx / WEIGHT_MAX - di;
+							float dyf = (float)fy / WEIGHT_MAX - dj;
+							int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
+							if(ri >= CURVE_RAD_SIZE) continue;
+							int w = curve_rad_lut[ri];
+							if(w <= 0) continue;
+							const int lx3 = lx * 3;
+							for(int c = 0; c < 3; c++) acc[c] += RD3(rowJ, lx3+c) * w;
+							wsum += w;
+						}
+					}
+					if(wsum > 0)
+						for(int c = 0; c < 3; c++)
+							WR3(dst_row, x3+c, (acc[c] + wsum/2) / wsum);
+					else {
+						const int sx3 = sx * 3;
+						WR3(dst_row, x3,   RD3(row2, sx3));
+						WR3(dst_row, x3+1, RD3(row2, sx3+1));
+						WR3(dst_row, x3+2, RD3(row2, sx3+2));
+					}
+				}
+			}
             else
             {
-                // modes 0/1/2 : logique avec branchement hl (inchangée)
-                int l1, l2, l3;
-                if(hl == 1) {
-                    l1 = sy; l2 = sy;
-                    l3 = (sy+1 < in_h) ? sy+1 : sy;
-                } else if(hl == -1) {
-                    l1 = sy; l2 = sy;
-                    l3 = (sy-1 >= 0) ? sy-1 : sy;
-                } else { l1 = l2 = l3 = sy; }
- 
-                const unsigned char *row3 = src_buf_ptr + l3 * in_w3 * bps_in;
- 
+                // modes 0/1/2 : inchangé
+                int sy_v2 = sy;
+                if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
+                if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
+                const unsigned char *row3 = src_buf_ptr + sy_v2 * in_w3 * bps_in;
+
                 if(hl == 0)
                 {
                     int x3 = 0;
@@ -1258,18 +1319,16 @@ void process_files_2d(const unsigned char * restrict in_buf,
                     int x3 = 0;
                     for(int x = 0; x < out_w; x++, x3 += 3)
                     {
-                        const int sx  = map->w_src [map_w_base + x];
-                        const int wl  = map->w_flag[map_w_base + x];
-                        const int sx3 = sx * 3;
+                        const int sx   = map->w_src [map_w_base + x];
+                        const int wl   = map->w_flag[map_w_base + x];
+                        const int sx3  = sx * 3;
                         const int sx3b = (wl == 1) ? (sx3+3<in_w3?sx3+3:sx3)
                                        : (wl ==-1) ? (sx3-3>=0   ?sx3-3:sx3)
                                                    : sx3;
                         if(wl == 0) {
-                            // V seulement
                             for(int c=0;c<3;c++)
                                 WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row3,sx3+c))>>1);
                         } else {
-                            // 2D : sélection d'axe par cohérence
                             int dH=0, dV=0, dD=0;
                             for(int c=0;c<3;c++) {
                                 int s = RD3(row2,sx3+c);
@@ -1727,11 +1786,13 @@ int main(int argc, char **argv)
 	map.w_weight = NULL;
 	map.w_heavy  = NULL;
 	map.w_frac   = NULL;
+	map.w_pos    = NULL;
 	map.h_src    = NULL;
 	map.h_flag   = NULL;
 	map.h_weight = NULL;
 	map.h_heavy  = NULL;
 	map.h_frac   = NULL;
+	map.h_pos    = NULL;
 	map.w_length = 0;
 	map.h_length = 0;
 	
@@ -1741,11 +1802,13 @@ int main(int argc, char **argv)
 	map_uv.w_weight = NULL;
 	map_uv.w_heavy  = NULL;
 	map_uv.w_frac   = NULL;
+	map_uv.w_pos    = NULL;
 	map_uv.h_src    = NULL;
 	map_uv.h_flag   = NULL;
 	map_uv.h_weight = NULL;
 	map_uv.h_heavy  = NULL;
 	map_uv.h_frac   = NULL;
+	map_uv.h_pos    = NULL;
 	map_uv.w_length = 0;
 	map_uv.h_length = 0;
 	
@@ -1990,11 +2053,13 @@ int main(int argc, char **argv)
 		map.w_weight = ALIGNED_MALLOC(map.w_length * sizeof(int), 64);
 		map.w_heavy  = ALIGNED_MALLOC(map.w_length * sizeof(int), 64);
 		map.w_frac   = ALIGNED_MALLOC(map.w_length * sizeof(int), 64);
+		map.w_pos    = ALIGNED_MALLOC(map.w_length * sizeof(int), 64);
 		map.h_src    = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		map.h_flag   = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		map.h_weight = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		map.h_heavy  = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 		map.h_frac   = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
+		map.h_pos    = ALIGNED_MALLOC(map.h_length * sizeof(int), 64);
 
 		if(need_map_uv)
 		{
@@ -2015,21 +2080,23 @@ int main(int argc, char **argv)
 			map_uv.w_weight = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
 			map_uv.w_heavy  = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
 			map_uv.w_frac   = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
+			map_uv.w_pos    = ALIGNED_MALLOC(map_uv.w_length * sizeof(int), 64);
 			map_uv.h_src    = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
 			map_uv.h_flag   = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
 			map_uv.h_weight = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
 			map_uv.h_heavy  = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
 			map_uv.h_frac   = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
+			map_uv.h_pos    = ALIGNED_MALLOC(map_uv.h_length * sizeof(int), 64);
 
 			if(!map_uv.w_src || !map_uv.w_flag || !map_uv.w_weight || !map_uv.w_heavy ||
 			   !map_uv.h_src || !map_uv.h_flag || !map_uv.h_weight || !map_uv.h_heavy)
 			{
 				ALIGNED_FREE(map_uv.w_src);   ALIGNED_FREE(map_uv.w_flag);
 				ALIGNED_FREE(map_uv.w_weight);ALIGNED_FREE(map_uv.w_heavy);
-				ALIGNED_FREE(map_uv.w_frac);
+				ALIGNED_FREE(map_uv.w_frac);  ALIGNED_FREE(map_uv.w_pos);
 				ALIGNED_FREE(map_uv.h_src);   ALIGNED_FREE(map_uv.h_flag);
 				ALIGNED_FREE(map_uv.h_weight);ALIGNED_FREE(map_uv.h_heavy);
-				ALIGNED_FREE(map_uv.h_frac);
+				ALIGNED_FREE(map_uv.h_frac);  ALIGNED_FREE(map_uv.h_pos);
 				fprintf(stderr, "ALIGNED_MALLOC error (map_uv)\n");
 				return -1;
 			}
@@ -2074,13 +2141,15 @@ int main(int argc, char **argv)
 			ALIGNED_FREE(map.w_flag);
 			ALIGNED_FREE(map.w_weight);
 			ALIGNED_FREE(map.w_heavy);
+			ALIGNED_FREE(map.w_frac);
+			ALIGNED_FREE(map.w_pos);
 			ALIGNED_FREE(map.h_src);
 			ALIGNED_FREE(map.h_flag);
 			ALIGNED_FREE(map.h_weight);
 			ALIGNED_FREE(map.h_heavy);
 			ALIGNED_FREE(tmp_weights);
-			ALIGNED_FREE(map.w_frac);
 			ALIGNED_FREE(map.h_frac);
+			ALIGNED_FREE(map.h_pos);			
 			
 			for(int t=0; t<NB_THREADS; t++)
 			{
@@ -2119,11 +2188,13 @@ int main(int argc, char **argv)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_LINEAR, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
+		compute_curve_rad_lut(3, curve_base);
 	}
 	else if(mode == 4)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
+		compute_curve_rad_lut(4, curve_base);
 	}
 	else if(mode == 2)
 	{
@@ -2144,7 +2215,7 @@ int main(int argc, char **argv)
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_kaiser4_lut(kaiser_beta);
-		compute_kaiser_rad_lut(kaiser_beta);
+		compute_kaiser_rad_lut(kaiser_beta, curve_base);
 	}
 	
 	if(need_map_uv)
@@ -2322,12 +2393,14 @@ int main(int argc, char **argv)
 	ALIGNED_FREE(map.w_weight);
 	ALIGNED_FREE(map.w_heavy);
 	ALIGNED_FREE(map.w_frac);
+	ALIGNED_FREE(map.w_pos);
 	ALIGNED_FREE(map.h_src);
 	ALIGNED_FREE(map.h_flag);
 	ALIGNED_FREE(map.h_weight);
 	ALIGNED_FREE(map.h_heavy);
 	ALIGNED_FREE(tmp_weights);
 	ALIGNED_FREE(map.h_frac);
+	ALIGNED_FREE(map.h_pos);
 	
 	if(need_map_uv)
 	{
@@ -2336,11 +2409,13 @@ int main(int argc, char **argv)
 		ALIGNED_FREE(map_uv.w_weight);
 		ALIGNED_FREE(map_uv.w_heavy);
 		ALIGNED_FREE(map_uv.w_frac);
+		ALIGNED_FREE(map_uv.w_pos);
 		ALIGNED_FREE(map_uv.h_src);
 		ALIGNED_FREE(map_uv.h_flag);
 		ALIGNED_FREE(map_uv.h_weight);
 		ALIGNED_FREE(map_uv.h_heavy);
 		ALIGNED_FREE(map_uv.h_frac);
+		ALIGNED_FREE(map_uv.h_pos);
 	}
 
 	
