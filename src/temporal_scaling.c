@@ -192,6 +192,64 @@ void compute_kaiser4_lut(double beta)
 #define KAISER_RAD_SIZE (3 * WEIGHT_MAX + 1)
 static int kaiser_rad_lut[KAISER_RAD_SIZE];
 
+#define CURVE_RAD_SIZE (3 * WEIGHT_MAX + 1)
+static int curve_rad_lut[CURVE_RAD_SIZE];
+
+#define NQUANT 64
+ 
+static int kaiser_w2d[NQUANT * NQUANT][16];
+static int curve_w2d [NQUANT * NQUANT][16];
+ 
+static void build_kaiser_w2d(void)
+{
+    for(int fy_q = 0; fy_q < NQUANT; fy_q++)
+    for(int fx_q = 0; fx_q < NQUANT; fx_q++)
+    {
+        int fx = fx_q * WEIGHT_MAX / NQUANT;
+        int fy = fy_q * WEIGHT_MAX / NQUANT;
+        int tmp[16], wsum = 0;
+        for(int dj = -1; dj <= 2; dj++)
+        for(int di = -1; di <= 2; di++)
+        {
+            float dxf = (float)fx / WEIGHT_MAX - di;
+            float dyf = (float)fy / WEIGHT_MAX - dj;
+            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
+            int w  = (ri < KAISER_RAD_SIZE) ? kaiser_rad_lut[ri] : 0;
+            tmp[(dj+1)*4 + (di+1)] = w;
+            wsum += w;
+        }
+        int idx = fy_q * NQUANT + fx_q;
+        for(int i = 0; i < 16; i++)
+            kaiser_w2d[idx][i] = wsum > 0
+                ? (tmp[i] * WEIGHT_MAX + wsum/2) / wsum : 0;
+    }
+}
+ 
+static void build_curve_w2d(void)
+{
+    for(int fy_q = 0; fy_q < NQUANT; fy_q++)
+    for(int fx_q = 0; fx_q < NQUANT; fx_q++)
+    {
+        int fx = fx_q * WEIGHT_MAX / NQUANT;
+        int fy = fy_q * WEIGHT_MAX / NQUANT;
+        int tmp[16], wsum = 0;
+        for(int dj = -1; dj <= 2; dj++)
+        for(int di = -1; di <= 2; di++)
+        {
+            float dxf = (float)fx / WEIGHT_MAX - di;
+            float dyf = (float)fy / WEIGHT_MAX - dj;
+            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
+            int w  = (ri < CURVE_RAD_SIZE) ? curve_rad_lut[ri] : 0;
+            tmp[(dj+1)*4 + (di+1)] = w;
+            wsum += w;
+        }
+        int idx = fy_q * NQUANT + fx_q;
+        for(int i = 0; i < 16; i++)
+            curve_w2d[idx][i] = wsum > 0
+                ? (tmp[i] * WEIGHT_MAX + wsum/2) / wsum : 0;
+    }
+}
+
 // LUT radiale pour mode 5 en 2D isotrope.
 // Calcule kaiser_sinc(r, lobes=2, beta) pour r dans [0 .. sqrt(2)*2],
 // indexé par r * WEIGHT_MAX (entier).
@@ -216,10 +274,8 @@ void compute_kaiser_rad_lut(double beta, double base)
             kaiser_rad_lut[ri] = vi < 0 ? 0 : vi;
         }
     }
+	build_kaiser_w2d();
 }
-
-#define CURVE_RAD_SIZE (3 * WEIGHT_MAX + 1)
-static int curve_rad_lut[CURVE_RAD_SIZE];
 
 void compute_curve_rad_lut(int mode, double base)
 {
@@ -243,8 +299,8 @@ void compute_curve_rad_lut(int mode, double base)
         int vi = (int)(v * (double)WEIGHT_MAX + 0.5);
         curve_rad_lut[ri] = vi < 0 ? 0 : vi;
     }
+	build_curve_w2d();
 }
-
 
 void usage(void)
 {
@@ -923,6 +979,7 @@ void process_files_plane(const unsigned char * restrict in_plane,
 // process_files_2d_plane — version 2D, 1 canal planar
 // ============================================================
 
+__attribute__((optimize("O3,unroll-loops")))
 void process_files_2d_plane(const unsigned char * restrict in_plane,
                              const unsigned char * restrict next_plane,
                              unsigned char * restrict blend_plane,
@@ -934,9 +991,10 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                              const int ratio, const int mode,
                              const int bps_in, const int bps_out)
 {
-    const int in_size  = in_w * in_h;
-    const int weighted = (mode == 3 || mode == 4);
-    const int mode5    = (mode == 5);
+    const int in_size   = in_w * in_h;
+    const int weighted  = (mode == 3 || mode == 4);
+    const int mode5     = (mode == 5);
+    const int fast_8bit = (bps_in == 1 && bps_out == 1);
  
     #define RD(row, x) \
         ((bps_in == 1) ? ((int)(row##_8)[x] << 8) \
@@ -981,88 +1039,94 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                 sy = hpos / WEIGHT_MAX;
                 fy = hpos % WEIGHT_MAX;
             } else {
-                sy = map->h_src [map_h_base + y];
+                sy = map->h_src[map_h_base + y];
                 fy = 0;
             }
             const int hl = map->h_flag[map_h_base + y];
-
+ 
             uint16_t      *dst16     = (uint16_t *)(out_plane + offset + y * out_w * bps_out);
             unsigned char *dst_row_8 =               out_plane + offset + y * out_w * bps_out;
-
+ 
             const unsigned char *row2_8  = src_plane + sy * in_w * bps_in;
             const uint16_t      *row2_16 = (const uint16_t *)row2_8;
-
-            if(mode5)
+ 
+            if(mode5 || weighted)
             {
+                const unsigned char *rows_8 [4];
+                const uint16_t      *rows_16[4];
+                for(int dj = -1; dj <= 2; dj++) {
+                    int ly = sy + dj;
+                    ly = ly < 0 ? 0 : ly >= in_h ? in_h-1 : ly;
+                    rows_8 [dj+1] = src_plane + ly * in_w * bps_in;
+                    rows_16[dj+1] = (const uint16_t *)rows_8[dj+1];
+                }
+ 
+                const int fy_q    = fy * NQUANT / WEIGHT_MAX;
+                const int *lut_base = mode5
+                    ? &kaiser_w2d[fy_q * NQUANT][0]
+                    : &curve_w2d [fy_q * NQUANT][0];
+ 
                 for(int x = 0; x < out_w; x++)
                 {
                     const int wpos = map->w_pos[map_w_base + x];
                     const int sx   = wpos / WEIGHT_MAX;
                     const int fx   = wpos % WEIGHT_MAX;
-
-                    int acc = 0, wsum = 0;
-                    for(int dj = -1; dj <= 2; dj++)
+                    const int fx_q = fx * NQUANT / WEIGHT_MAX;
+                    const int *w   = lut_base + fx_q * 16;
+ 
+                    int acc = 0;
+ 
+                    if(__builtin_expect(sx >= 1 && sx + 2 < in_w, 1))
                     {
-                        int ly = sy + dj;
-                        if(ly < 0) ly = 0;
-                        if(ly >= in_h) ly = in_h - 1;
-                        const unsigned char *rowJ_8  = src_plane + ly * in_w * bps_in;
-                        const uint16_t      *rowJ_16 = (const uint16_t *)rowJ_8;
-                        for(int di = -1; di <= 2; di++)
-                        {
-                            int lx = sx + di;
-                            if(lx < 0) lx = 0;
-                            if(lx >= in_w) lx = in_w - 1;
-                            float dxf = (float)fx / WEIGHT_MAX - di;
-                            float dyf = (float)fy / WEIGHT_MAX - dj;
-                            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
-                            if(ri >= KAISER_RAD_SIZE) continue;
-                            int w = kaiser_rad_lut[ri];
-                            if(w <= 0) continue;
-                            acc  += RD(rowJ, lx) * w;
-                            wsum += w;
+                        if(fast_8bit) {
+                            #pragma GCC ivdep
+                            for(int dj = 0; dj < 4; dj++) {
+                                const unsigned char * restrict rowJ = rows_8[dj] + (sx-1);
+                                const int *wrow = w + dj * 4;
+                                acc += (int)rowJ[0]*wrow[0] + (int)rowJ[1]*wrow[1]
+                                     + (int)rowJ[2]*wrow[2] + (int)rowJ[3]*wrow[3];
+                            }
+                            int v = acc >> WEIGHT_SHIFT;
+                            dst_row_8[x] = v < 0 ? 0 : v > 255 ? 255 : (unsigned char)v;
+                        } else {
+                            #pragma GCC ivdep
+                            for(int dj = 0; dj < 4; dj++) {
+                                const uint16_t * restrict rowJ = rows_16[dj] + (sx-1);
+                                const int *wrow = w + dj * 4;
+                                acc += (int)rowJ[0]*wrow[0] + (int)rowJ[1]*wrow[1]
+                                     + (int)rowJ[2]*wrow[2] + (int)rowJ[3]*wrow[3];
+                            }
+                            WR(x, acc >> WEIGHT_SHIFT);
                         }
                     }
-                    if(wsum > 0) WR(x, (acc + wsum/2) / wsum);
-                    else         WR(x, RD(row2, sx));
-                }
-            }
-            else if(weighted)
-            {
-                for(int x = 0; x < out_w; x++)
-                {
-                    const int wpos   = map->w_pos[map_w_base + x];
-                    const int sx     = wpos / WEIGHT_MAX;
-                    const int wl     = map->w_flag[map_w_base + x];
-                    const int fx     = wpos % WEIGHT_MAX;
-                    const int fx_eff = (wl == -1 || (wl == 0 && (r % 2 == 1)))
-                                       ? (WEIGHT_MAX - fx) : fx;
-
-                    int acc = 0, wsum = 0;
-                    for(int dj = -1; dj <= 2; dj++)
+                    else
                     {
-                        int ly = sy + dj;
-                        if(ly < 0) ly = 0;
-                        if(ly >= in_h) ly = in_h - 1;
-                        const unsigned char *rowJ_8  = src_plane + ly * in_w * bps_in;
-                        const uint16_t      *rowJ_16 = (const uint16_t *)rowJ_8;
-                        for(int di = -1; di <= 2; di++)
-                        {
+                        // slow path : clamp
+                        int lxs[4];
+                        for(int di = -1; di <= 2; di++) {
                             int lx = sx + di;
-                            if(lx < 0) lx = 0;
-                            if(lx >= in_w) lx = in_w - 1;
-                            float dxf = (float)fx / WEIGHT_MAX - di;
-							float dyf = (float)fy / WEIGHT_MAX - dj;
-                            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
-                            if(ri >= CURVE_RAD_SIZE) continue;
-                            int w = curve_rad_lut[ri];
-                            if(w <= 0) continue;
-                            acc  += RD(rowJ, lx) * w;
-                            wsum += w;
+                            lx = lx < 0 ? 0 : lx >= in_w ? in_w-1 : lx;
+                            lxs[di+1] = lx;
+                        }
+                        if(fast_8bit) {
+                            for(int dj = 0; dj < 4; dj++) {
+                                const unsigned char *rowJ = rows_8[dj];
+                                const int *wrow = w + dj * 4;
+                                for(int di = 0; di < 4; di++)
+                                    acc += (int)rowJ[lxs[di]] * wrow[di];
+                            }
+                            int v = acc >> WEIGHT_SHIFT;
+                            dst_row_8[x] = v < 0 ? 0 : v > 255 ? 255 : (unsigned char)v;
+                        } else {
+                            for(int dj = 0; dj < 4; dj++) {
+                                const uint16_t *rowJ = rows_16[dj];
+                                const int *wrow = w + dj * 4;
+                                for(int di = 0; di < 4; di++)
+                                    acc += (int)rowJ[lxs[di]] * wrow[di];
+                            }
+                            WR(x, acc >> WEIGHT_SHIFT);
                         }
                     }
-                    if(wsum > 0) WR(x, (acc + wsum/2) / wsum);
-                    else         WR(x, RD(row2, sx));
                 }
             }
             else
@@ -1073,7 +1137,7 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                 if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
                 const unsigned char *row3_8  = src_plane + sy_v2 * in_w * bps_in;
                 const uint16_t      *row3_16 = (const uint16_t *)row3_8;
-
+ 
                 if(hl == 0)
                 {
                     for(int x = 0; x < out_w; x++)
@@ -1123,6 +1187,7 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
 // process_files_2d — version optimisée
 // ============================================================
 
+__attribute__((optimize("O3,unroll-loops")))
 void process_files_2d(const unsigned char * restrict in_buf,
                       const unsigned char * restrict next_buf,
                       unsigned char * restrict blend_buf,
@@ -1135,11 +1200,13 @@ void process_files_2d(const unsigned char * restrict in_buf,
                       const int ratio, const int mode,
                       const int bps_in, const int bps_out)
 {
-    const int in_w3   = in_w * 3;
-    const int out_w3  = out_w * 3;
-    const int in_size = in_w * in_h * 3;
-    const int weighted = (mode == 3 || mode == 4);
-    const int mode5    = (mode == 5);
+    const int in_w3    = in_w * 3;
+    const int out_w3   = out_w * 3;
+    const int in_size  = in_w * in_h * 3;
+    const int weighted  = (mode == 3 || mode == 4);
+    const int mode5     = (mode == 5);
+    const int fast_8bit = (bps_in == 1 && bps_out == 1);
+    const int bps3_in   = 3 * bps_in;
  
     #define RD3(ptr, i) \
         ((bps_in == 1) ? ((int)(ptr)[i] << 8) \
@@ -1147,8 +1214,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
     #define WR3(ptr, i, v) do { \
         int _v = (v); \
         _v = _v < 0 ? 0 : _v > 65535 ? 65535 : _v; \
-        if(bps_out == 1) (ptr)[i]          = (unsigned char)(_v >> 8); \
-        else ((uint16_t*)(ptr))[i]         = (uint16_t)_v; \
+        if(bps_out == 1) (ptr)[i]      = (unsigned char)(_v >> 8); \
+        else ((uint16_t*)(ptr))[i]     = (uint16_t)_v; \
     } while(0)
  
     unsigned int offset = 0;
@@ -1178,114 +1245,133 @@ void process_files_2d(const unsigned char * restrict in_buf,
  
         for(int y = 0; y < out_h; y++)
         {
-            // sy/fy : position continue pour modes 3/4/5, discrete pour 0/1/2
             int sy, fy;
             if(weighted || mode5) {
                 const int hpos = map->h_pos[map_h_base + y];
                 sy = hpos / WEIGHT_MAX;
                 fy = hpos % WEIGHT_MAX;
             } else {
-                sy = map->h_src [map_h_base + y];
+                sy = map->h_src[map_h_base + y];
                 fy = 0;
             }
             const int hl = map->h_flag[map_h_base + y];
-
+ 
             unsigned char *dst_row = out_buf + offset + y * out_w3 * bps_out;
-
             const unsigned char *row2 = src_buf_ptr + sy * in_w3 * bps_in;
-
-            if(mode5)
+ 
+            if(mode5 || weighted)
             {
+                // pré-calcul des 4 lignes source (clamp vertical une fois)
+                const unsigned char *rows[4];
+                for(int dj = -1; dj <= 2; dj++) {
+                    int ly = sy + dj;
+                    ly = ly < 0 ? 0 : ly >= in_h ? in_h-1 : ly;
+                    rows[dj+1] = src_buf_ptr + ly * in_w3 * bps_in;
+                }
+ 
+                const int fy_q    = fy * NQUANT / WEIGHT_MAX;
+                const int *lut_base = mode5
+                    ? &kaiser_w2d[fy_q * NQUANT][0]
+                    : &curve_w2d [fy_q * NQUANT][0];
+ 
                 int x3 = 0;
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
-                    const int wpos = map->w_pos[map_w_base + x];
-                    const int sx   = wpos / WEIGHT_MAX;
-                    const int fx   = wpos % WEIGHT_MAX;
-
-                    int acc[3] = {0,0,0}, wsum = 0;
-                    for(int dj = -1; dj <= 2; dj++)
+                    const int wpos  = map->w_pos[map_w_base + x];
+                    const int sx    = wpos / WEIGHT_MAX;
+                    const int fx    = wpos % WEIGHT_MAX;
+                    const int fx_q  = fx * NQUANT / WEIGHT_MAX;
+                    const int *w    = lut_base + fx_q * 16;
+                    const int sx_off = (sx - 1) * bps3_in;
+ 
+                    int acc0 = 0, acc1 = 0, acc2 = 0;
+ 
+                    if(__builtin_expect(sx >= 1 && sx + 2 < in_w, 1))
                     {
-                        int ly = sy + dj;
-                        if(ly < 0) ly = 0;
-                        if(ly >= in_h) ly = in_h - 1;
-                        const unsigned char *rowJ = src_buf_ptr + ly * in_w3 * bps_in;
-                        for(int di = -1; di <= 2; di++)
+                        if(fast_8bit)
                         {
-                            int lx = sx + di;
-                            if(lx < 0) lx = 0;
-                            if(lx >= in_w) lx = in_w - 1;
-                            float dxf = (float)fx / WEIGHT_MAX - di;
-                            float dyf = (float)fy / WEIGHT_MAX - dj;
-                            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
-                            if(ri >= KAISER_RAD_SIZE) continue;
-                            int w = kaiser_rad_lut[ri];
-                            if(w <= 0) continue;
-                            const int lx3 = lx * 3;
-                            for(int c = 0; c < 3; c++) acc[c] += RD3(rowJ, lx3+c) * w;
-                            wsum += w;
+                            // fast path 8bit : pas de <<8, valeurs 0..255
+                            // max acc = 255*256 = 65280 → tient en int32
+                            // meilleure vectorisation AVX-512
+                            #pragma GCC ivdep
+                            for(int dj = 0; dj < 4; dj++) {
+                                const unsigned char * restrict rowJ = rows[dj] + sx_off;
+                                const int *wrow = w + dj * 4;
+                                acc0 += (int)rowJ[0]*wrow[0] + (int)rowJ[3]*wrow[1]
+                                      + (int)rowJ[6]*wrow[2] + (int)rowJ[9]*wrow[3];
+                                acc1 += (int)rowJ[1]*wrow[0] + (int)rowJ[4]*wrow[1]
+                                      + (int)rowJ[7]*wrow[2] + (int)rowJ[10]*wrow[3];
+                                acc2 += (int)rowJ[2]*wrow[0] + (int)rowJ[5]*wrow[1]
+                                      + (int)rowJ[8]*wrow[2] + (int)rowJ[11]*wrow[3];
+                            }
+                            // écriture directe — pas de >>8 supplémentaire
+                            int v0 = acc0 >> WEIGHT_SHIFT;
+                            int v1 = acc1 >> WEIGHT_SHIFT;
+                            int v2 = acc2 >> WEIGHT_SHIFT;
+                            dst_row[x3]   = v0 < 0 ? 0 : v0 > 255 ? 255 : (unsigned char)v0;
+                            dst_row[x3+1] = v1 < 0 ? 0 : v1 > 255 ? 255 : (unsigned char)v1;
+                            dst_row[x3+2] = v2 < 0 ? 0 : v2 > 255 ? 255 : (unsigned char)v2;
+                        }
+                        else
+                        {
+                            // fast path 16bit
+                            #pragma GCC ivdep
+                            for(int dj = 0; dj < 4; dj++) {
+                                const unsigned char * restrict rowJ = rows[dj] + sx_off;
+                                const int *wrow = w + dj * 4;
+                                acc0 += RD3(rowJ,  0)*wrow[0] + RD3(rowJ,  3)*wrow[1]
+                                      + RD3(rowJ,  6)*wrow[2] + RD3(rowJ,  9)*wrow[3];
+                                acc1 += RD3(rowJ,  1)*wrow[0] + RD3(rowJ,  4)*wrow[1]
+                                      + RD3(rowJ,  7)*wrow[2] + RD3(rowJ, 10)*wrow[3];
+                                acc2 += RD3(rowJ,  2)*wrow[0] + RD3(rowJ,  5)*wrow[1]
+                                      + RD3(rowJ,  8)*wrow[2] + RD3(rowJ, 11)*wrow[3];
+                            }
+                            WR3(dst_row, x3,   acc0 >> WEIGHT_SHIFT);
+                            WR3(dst_row, x3+1, acc1 >> WEIGHT_SHIFT);
+                            WR3(dst_row, x3+2, acc2 >> WEIGHT_SHIFT);
                         }
                     }
-                    if(wsum > 0)
-						for(int c = 0; c < 3; c++) WR3(dst_row, x3+c, (acc[c] + wsum/2) / wsum);
-                    else {
-                        const int sx3 = sx * 3;
-                        WR3(dst_row, x3,   RD3(row2, sx3));
-                        WR3(dst_row, x3+1, RD3(row2, sx3+1));
-                        WR3(dst_row, x3+2, RD3(row2, sx3+2));
+                    else
+                    {
+                        // slow path : clamp horizontal (<1% des pixels)
+                        int lx3s[4];
+                        for(int di = -1; di <= 2; di++) {
+                            int lx = sx + di;
+                            lx = lx < 0 ? 0 : lx >= in_w ? in_w-1 : lx;
+                            lx3s[di+1] = lx * bps3_in;
+                        }
+                        for(int dj = 0; dj < 4; dj++) {
+                            const unsigned char *rowJ = rows[dj];
+                            const int *wrow = w + dj * 4;
+                            if(fast_8bit) {
+                                for(int di = 0; di < 4; di++) {
+                                    int wt = wrow[di];
+                                    acc0 += (int)rowJ[lx3s[di]]   * wt;
+                                    acc1 += (int)rowJ[lx3s[di]+1] * wt;
+                                    acc2 += (int)rowJ[lx3s[di]+2] * wt;
+                                }
+                            } else {
+                                for(int di = 0; di < 4; di++) {
+                                    int wt = wrow[di];
+                                    acc0 += RD3(rowJ, lx3s[di])   * wt;
+                                    acc1 += RD3(rowJ, lx3s[di]+1) * wt;
+                                    acc2 += RD3(rowJ, lx3s[di]+2) * wt;
+                                }
+                            }
+                        }
+                        if(fast_8bit) {
+                            int v0 = acc0>>WEIGHT_SHIFT, v1 = acc1>>WEIGHT_SHIFT, v2 = acc2>>WEIGHT_SHIFT;
+                            dst_row[x3]   = v0<0?0:v0>255?255:(unsigned char)v0;
+                            dst_row[x3+1] = v1<0?0:v1>255?255:(unsigned char)v1;
+                            dst_row[x3+2] = v2<0?0:v2>255?255:(unsigned char)v2;
+                        } else {
+                            WR3(dst_row, x3,   acc0 >> WEIGHT_SHIFT);
+                            WR3(dst_row, x3+1, acc1 >> WEIGHT_SHIFT);
+                            WR3(dst_row, x3+2, acc2 >> WEIGHT_SHIFT);
+                        }
                     }
                 }
             }
-            else if(weighted)
-			{
-				// modes 3/4 : 4x4 isotrope avec curve_rad_lut
-				// même structure que mode5 mais LUT différente
-				const int fy = map->h_frac[map_h_base + y];  // gardé pour la direction
-
-				int x3 = 0;
-				for(int x = 0; x < out_w; x++, x3 += 3)
-				{
-					const int wpos = map->w_pos[map_w_base + x];
-					const int sx   = wpos / WEIGHT_MAX;
-					const int wl   = map->w_flag[map_w_base + x];
-					const int fx   = wpos % WEIGHT_MAX;
-					const int fx_eff = (wl == -1 || (wl == 0 && (r % 2 == 1)))
-									   ? (WEIGHT_MAX - fx) : fx;
-
-					int acc[3] = {0,0,0}, wsum = 0;
-					for(int dj = -1; dj <= 2; dj++)
-					{
-						int ly = sy + dj;
-						if(ly < 0) ly = 0;
-						if(ly >= in_h) ly = in_h - 1;
-						const unsigned char *rowJ = src_buf_ptr + ly * in_w3 * bps_in;
-						for(int di = -1; di <= 2; di++)
-						{
-							int lx = sx + di;
-							if(lx < 0) lx = 0;
-							if(lx >= in_w) lx = in_w - 1;
-							float dxf = (float)fx / WEIGHT_MAX - di;
-							float dyf = (float)fy / WEIGHT_MAX - dj;
-							int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
-							if(ri >= CURVE_RAD_SIZE) continue;
-							int w = curve_rad_lut[ri];
-							if(w <= 0) continue;
-							const int lx3 = lx * 3;
-							for(int c = 0; c < 3; c++) acc[c] += RD3(rowJ, lx3+c) * w;
-							wsum += w;
-						}
-					}
-					if(wsum > 0)
-						for(int c = 0; c < 3; c++)
-							WR3(dst_row, x3+c, (acc[c] + wsum/2) / wsum);
-					else {
-						const int sx3 = sx * 3;
-						WR3(dst_row, x3,   RD3(row2, sx3));
-						WR3(dst_row, x3+1, RD3(row2, sx3+1));
-						WR3(dst_row, x3+2, RD3(row2, sx3+2));
-					}
-				}
-			}
             else
             {
                 // modes 0/1/2 : inchangé
@@ -1293,7 +1379,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
                 if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
                 if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
                 const unsigned char *row3 = src_buf_ptr + sy_v2 * in_w3 * bps_in;
-
+ 
                 if(hl == 0)
                 {
                     int x3 = 0;
