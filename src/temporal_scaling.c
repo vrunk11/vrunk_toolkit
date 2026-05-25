@@ -1061,12 +1061,6 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
  
         for(int y = 0; y < out_h; y++)
         {
-			// prefetch pour y+1
-    if(y + 1 < out_h) {
-        const int next_hpos = h_pos_ptr[y + 1];
-        const int next_sy = next_hpos >> WEIGHT_SHIFT;
-        __builtin_prefetch(src_plane + next_sy * in_w, 0, 1);
-    }
             int sy, fy;
             if(use_2d_kernel) {
                 const int hpos = h_pos_ptr[y];
