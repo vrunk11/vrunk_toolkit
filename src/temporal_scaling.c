@@ -1225,52 +1225,47 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                 }
             }
             else
-            {
-				const int hl = map->h_flag[map_h_base + y];
-                int sy_v2 = sy;
-                if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
-                if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
-                const unsigned char *row3_8  = src_plane + sy_v2 * in_w * bps_in;
-                const uint16_t      *row3_16 = (const uint16_t *)row3_8;
- 
-                if(hl == 0)
-                {
-                    for(int x = 0; x < out_w; x++)
-                    {
-                        const int sx = map->w_src [map_w_base + x];
-                        const int wl = (mode >= 1) ? map->w_flag[map_w_base + x] : 0;
-                        if(wl == 0) {
-                            WR(x, RD(row2, sx));
-                        } else {
-                            const int sx_b = (wl == 1) ? (sx+1<in_w?sx+1:sx)
-                                                       : (sx-1>=0  ?sx-1:sx);
-                            WR(x, (RD(row2,sx) + RD(row2,sx_b)) >> 1);
-                        }
-                    }
-                }
-                else
-                {
-                    for(int x = 0; x < out_w; x++)
-                    {
-                        const int sx   = map->w_src [map_w_base + x];
-                        const int wl   = map->w_flag[map_w_base + x];
-                        const int sx_b = (wl == 1) ? (sx+1<in_w?sx+1:sx)
-                                       : (wl ==-1) ? (sx-1>=0  ?sx-1:sx)
-                                                   : sx;
-                        if(wl == 0) {
-                            WR(x, (RD(row2,sx) + RD(row3,sx)) >> 1);
-                        } else {
-                            int s  = RD(row2, sx);
-                            int dH = abs(s - RD(row2, sx_b));
-                            int dV = abs(s - RD(row3, sx  ));
-                            int dD = abs(s - RD(row3, sx_b));
-                            if(dH<=dV && dH<=dD)      WR(x,(s+RD(row2,sx_b))>>1);
-                            else if(dV<=dH && dV<=dD) WR(x,(s+RD(row3,sx  ))>>1);
-                            else                       WR(x,(s+RD(row3,sx_b))>>1);
-                        }
-                    }
-                }
-            }
+			{
+				const int hl = (mode >= 1) ? map->h_flag[map_h_base + y] : 0;
+				int sy_v2 = sy;
+				if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
+				if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
+				const unsigned char *row3_8  = src_plane + sy_v2 * in_w * bps_in;
+				const uint16_t      *row3_16 = (const uint16_t *)row3_8;
+
+				if(hl == 0)
+				{
+					for(int x = 0; x < out_w; x++)
+					{
+						const int sx = map->w_src [map_w_base + x];
+						const int wl = (mode >= 1) ? map->w_flag[map_w_base + x] : 0;
+						if(wl == 0) {
+							WR(x, RD(row2, sx));
+						} else {
+							const int sx_b = (wl == 1) ? (sx+1<in_w?sx+1:sx)
+													   : (sx-1>=0  ?sx-1:sx);
+							WR(x, (RD(row2,sx) + RD(row2,sx_b)) >> 1);
+						}
+					}
+				}
+				else
+				{
+					for(int x = 0; x < out_w; x++)
+					{
+						const int sx = map->w_src [map_w_base + x];
+						const int wl = (mode >= 1) ? map->w_flag[map_w_base + x] : 0;
+						const int sx_b = (wl != 0)
+							? ((wl == 1) ? (sx+1<in_w?sx+1:sx) : (sx-1>=0?sx-1:sx))
+							: sx;
+						if(wl == 0) {
+							WR(x, (RD(row2,sx) + RD(row3,sx)) >> 1);
+						} else {
+							WR(x, (RD(row2,sx) + RD(row2,sx_b)
+								  + RD(row3,sx) + RD(row3,sx_b)) >> 2);
+						}
+					}
+				}
+			}
         }
         offset += out_w * out_h * bps_out;
     }
@@ -1546,6 +1541,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
             }
             else
             {
+                // ← fix mode 0 : hl forcé à 0 si mode == 0
+                const int hl   = (mode >= 1) ? map->h_flag[map_h_base + y] : 0;
                 int sy_v2 = sy;
                 if(hl ==  1) sy_v2 = (sy + 1 < in_h) ? sy + 1 : sy;
                 if(hl == -1) sy_v2 = (sy - 1 >= 0)   ? sy - 1 : sy;
@@ -1553,6 +1550,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
  
                 if(hl == 0)
                 {
+                    // axe horizontal seulement (ou nearest si mode 0)
                     int x3 = 0;
                     for(int x = 0; x < out_w; x++, x3 += 3)
                     {
@@ -1573,32 +1571,24 @@ void process_files_2d(const unsigned char * restrict in_buf,
                 }
                 else
                 {
+                    // axe vertical actif — blend 2D 4 coins
                     int x3 = 0;
                     for(int x = 0; x < out_w; x++, x3 += 3)
                     {
-                        const int sx   = map->w_src [map_w_base + x];
-                        const int wl   = map->w_flag[map_w_base + x];
-                        const int sx3  = sx * 3;
-                        const int sx3b = (wl == 1) ? (sx3+3<in_w3?sx3+3:sx3)
-                                       : (wl ==-1) ? (sx3-3>=0   ?sx3-3:sx3)
-                                                   : sx3;
+                        const int sx  = map->w_src [map_w_base + x];
+                        const int wl  = (mode >= 1) ? map->w_flag[map_w_base + x] : 0;
+                        const int sx3 = sx * 3;
                         if(wl == 0) {
+                            // vertical pur
                             for(int c=0;c<3;c++)
                                 WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row3,sx3+c))>>1);
                         } else {
-                            int dH=0, dV=0, dD=0;
-                            for(int c=0;c<3;c++) {
-                                int s = RD3(row2,sx3+c);
-                                dH += abs(s - RD3(row2,sx3b+c));
-                                dV += abs(s - RD3(row3,sx3 +c));
-                                dD += abs(s - RD3(row3,sx3b+c));
-                            }
-                            if(dH<=dV && dH<=dD)
-                                for(int c=0;c<3;c++) WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row2,sx3b+c))>>1);
-                            else if(dV<=dH && dV<=dD)
-                                for(int c=0;c<3;c++) WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row3,sx3 +c))>>1);
-                            else
-                                for(int c=0;c<3;c++) WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row3,sx3b+c))>>1);
+                            // 4 coins : H + V + diagonal
+                            const int sx3b = (wl == 1) ? (sx3+3<in_w3?sx3+3:sx3)
+                                                       : (sx3-3>=0   ?sx3-3:sx3);
+                            for(int c=0;c<3;c++)
+                                WR3(dst_row,x3+c,(RD3(row2,sx3+c)+RD3(row2,sx3b+c)
+                                                 +RD3(row3,sx3+c)+RD3(row3,sx3b+c))>>2);
                         }
                     }
                 }
