@@ -74,7 +74,7 @@ typedef struct {
     int16_t gx;   // gradient horizontal
     int16_t gy;   // gradient vertical
     int16_t mag;  // confiance 0..WEIGHT_MAX (magnitude normalisée)
-    int16_t ang;  // angle quantifié 0..NQUANT_ANGLE-1 (direction du bord)
+    int16_t conf;
 } GradPixel;
 
 typedef struct ThreadArgs ThreadArgs;
@@ -89,7 +89,8 @@ struct ThreadArgs
 	BresenhamMap *map_uv;
 	const int *tmp_weights;    // poids temporel par phase (taille = ratio)
 	GradPixel *grad;
-int aniso_strength_fp;  // 0..WEIGHT_MAX
+	int16_t   *dist_map;
+	int aniso_strength_fp;  // 0..WEIGHT_MAX
 	int mode_1d;
 	PixFmt in_pix_fmt;
 	PixFmt out_pix_fmt;
@@ -237,6 +238,10 @@ static int curve_rad_lut[CURVE_RAD_SIZE];
 // max_mag : magnitude au-delà de laquelle conf sature à WEIGHT_MAX.
 // Réglé empiriquement ; plus bas = anisotropie qui se déclenche plus tôt.
 #define GRAD_MAX_MAG 2048
+
+#define SHARP_HI       200   // borne haute rampe / seuil contour franc (mode 7)
+#define NARROW_DROP      2    // narrow si  mag_voisin * NARROW_DROP < mag_centre
+#define CONT_KEEP        2    // cont   si  mag_voisin * CONT_KEEP  >= mag_centre
  
 typedef struct {
     int16_t w [KERNEL_MAX_TAPS];   // poids normalisés (somme = WEIGHT_MAX)
@@ -252,12 +257,82 @@ static Kernel2D kaiser_k2d_uv[NQUANT * NQUANT];
 static Kernel2D curve_k2d    [NQUANT * NQUANT];
 static Kernel2D curve_k2d_uv [NQUANT * NQUANT];
 
-// modulation multiplicative par tap selon l'angle du bord.
-// indexé [angle][(dy+2)*6 + (dx+2)], valeur 0..WEIGHT_MAX.
-// 1.0 (=WEIGHT_MAX) si le tap est sur le bord, atténué s'il le traverse.
-static int16_t aniso_mod[NQUANT_ANGLE][36];
-
+#define MID_RAD_SIZE  CURVE_RAD_SIZE          // même taille d'index que les autres
+#define MID_LOBE_GAIN 0.5                       // atténuation des lobes négatifs
  
+static int mid_rad_lut[MID_RAD_SIZE];
+ 
+static Kernel2D mid_k2d   [NQUANT * NQUANT];
+static Kernel2D mid_k2d_uv[NQUANT * NQUANT];
+ 
+void compute_mid_rad_lut(double beta)
+{
+    const double radius = 2.0;
+    const double inv_i0 = 1.0 / bessel_i0(beta);
+ 
+    for(int ri = 0; ri < MID_RAD_SIZE; ri++)
+    {
+        double r = (double)ri / (double)WEIGHT_MAX;
+ 
+        if(r >= radius) { mid_rad_lut[ri] = 0; continue; }
+ 
+        // sinc radial cardinal
+        double s;
+        if(r == 0.0) s = 1.0;
+        else { double px = M_PI * r; s = sin(px) / px; }
+ 
+        // fenêtre kaiser sur le support radius 2
+        double k = bessel_i0(beta * sqrt(1.0 - (r/radius)*(r/radius))) * inv_i0;
+ 
+        double val = s * k;
+ 
+        // atténue uniquement les lobes négatifs
+        if(val < 0.0) val *= MID_LOBE_GAIN;
+ 
+        int vi = (val >= 0.0)
+               ?  (int)( val * (double)WEIGHT_MAX + 0.5)
+               : -(int)(-val * (double)WEIGHT_MAX + 0.5);
+        mid_rad_lut[ri] = vi;
+    }
+}
+
+// lecture clampée de mag dans la map de gradient
+static inline int mag_at(const GradPixel *grad, int x, int y, int in_w, int in_h)
+{
+    x = x < 0 ? 0 : x >= in_w ? in_w - 1 : x;
+    y = y < 0 ? 0 : y >= in_h ? in_h - 1 : y;
+    return (int)grad[y * in_w + x].mag;
+}
+ 
+// détecteur séparable d'artefact de compression / bruit axial.
+// Lit mag au centre + 4 voisins cardinaux. Pas de trigonométrie.
+static inline int is_compression_artifact(const GradPixel *grad,
+                                          int sx, int sy, int mag_c,
+                                          int in_w, int in_h)
+{
+    int mx_l = mag_at(grad, sx - 1, sy,     in_w, in_h);
+    int mx_r = mag_at(grad, sx + 1, sy,     in_w, in_h);
+    int my_u = mag_at(grad, sx,     sy - 1, in_w, in_h);
+    int my_d = mag_at(grad, sx,     sy + 1, in_w, in_h);
+ 
+    // étroit sur un axe : le centre domine et retombe fort des deux côtés
+    int narrow_x = (mx_l * NARROW_DROP < mag_c) && (mx_r * NARROW_DROP < mag_c);
+    int narrow_y = (my_u * NARROW_DROP < mag_c) && (my_d * NARROW_DROP < mag_c);
+ 
+    // continu sur un axe : le gradient reste soutenu des deux côtés
+    int cont_x = (mx_l * CONT_KEEP >= mag_c) && (mx_r * CONT_KEEP >= mag_c);
+    int cont_y = (my_u * CONT_KEEP >= mag_c) && (my_d * CONT_KEEP >= mag_c);
+ 
+    // 1) croix = étroit dans les deux axes (intersection de grille DCT)
+    int is_cross = narrow_x && narrow_y;
+ 
+    // 2) arête axiale = étroit sur un axe, continu sur l'autre
+    int is_axial_edge = (narrow_x && cont_y) || (narrow_y && cont_x);
+ 
+    return is_cross || is_axial_edge;
+}
+
+
 static void build_k2d(Kernel2D *out, const int *rad_lut, int rad_size, int stride)
 {
     for(int fy_q = 0; fy_q < NQUANT; fy_q++)
@@ -304,31 +379,6 @@ static void build_k2d(Kernel2D *out, const int *rad_lut, int rad_size, int strid
         int wcheck = 0;
         for(int i = 0; i < k->n; i++) wcheck += k->w[i];
         if(k->n > 0) k->w[0] += (int16_t)(WEIGHT_MAX - wcheck);
-    }
-}
-
-static void build_aniso_mod(void)
-{
-    for(int a = 0; a < NQUANT_ANGLE; a++)
-    {
-        // direction DU BORD (pas du gradient) : le gradient est
-        // perpendiculaire au bord, donc on a déjà tourné de 90° au
-        // moment du calcul de l'angle dans compute_gradient.
-        double theta = (double)a * M_PI / (double)NQUANT_ANGLE;
-        double ct = cos(theta), st = sin(theta);
- 
-        for(int dj = -2; dj <= 3; dj++)
-        for(int di = -2; di <= 3; di++)
-        {
-            // composante perpendiculaire au bord du tap (di, dj)
-            double q = -(double)di * st + (double)dj * ct;
-            // atténuation gaussienne : 1 sur le bord, décroît perpendiculairement
-            double m = exp(-ANISO_K * q * q);
-            int mi = (int)(m * (double)WEIGHT_MAX + 0.5);
-            if(mi < 0)          mi = 0;
-            if(mi > WEIGHT_MAX) mi = WEIGHT_MAX;
-            aniso_mod[a][(dj+2)*6 + (di+2)] = (int16_t)mi;
-        }
     }
 }
 
@@ -456,7 +506,95 @@ static void compute_gradient_rgb(const unsigned char *src,
     }
 }
 
-// renvoie la valeur interpolée pour 1 canal planar 8-bit.
+static void compute_conf_map(GradPixel *grad, int in_w, int in_h,
+                             int mode, int aniso_strength_fp)
+{
+    for(int y = 0; y < in_h; y++)
+    {
+        for(int x = 0; x < in_w; x++)
+        {
+            const int i   = y * in_w + x;
+            const int mag = grad[i].mag;
+ 
+            int conf;
+            if(mode == 7) {
+                if(mag <= ANISO_LOW
+                   || is_compression_artifact(grad, x, y, mag, in_w, in_h)) {
+                    conf = 0;
+                }
+                else if(mag >= ANISO_HIGH) {
+                    conf = WEIGHT_MAX;
+                }
+                else {
+                    conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+                }
+            }
+            else {  // mode 6
+                if(mag <= ANISO_LOW)       conf = 0;
+                else if(mag >= ANISO_HIGH) conf = WEIGHT_MAX;
+                else conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+            }
+            conf = (conf * aniso_strength_fp) >> WEIGHT_SHIFT;
+ 
+            grad[i].conf = (int16_t)conf;
+        }
+    }
+}
+
+#define COUTURE_N    2                              // largeur bande, px source
+#define COUTURE_FAR  ((COUTURE_N + 1) * WEIGHT_MAX) // sentinelle "plein doux"
+ 
+static void compute_couture_dist(const GradPixel * restrict grad,
+                                 int16_t * restrict dist_map,
+                                 int in_w, int in_h)
+{
+    const int R   = COUTURE_N;
+    const int R2  = R * R;
+ 
+    for(int y = 0; y < in_h; y++)
+    {
+        for(int x = 0; x < in_w; x++)
+        {
+            const int i = y * in_w + x;
+ 
+            // pixel net : distance nulle, plein net
+            if(grad[i].conf > 0) {
+                dist_map[i] = 0;
+                continue;
+            }
+ 
+            // pixel doux : cherche le net le plus proche dans le disque r<=R
+            int best2 = R2 + 1;   // carré de la meilleure distance trouvée
+            for(int dj = -R; dj <= R; dj++)
+            {
+                const int yy = y + dj;
+                if(yy < 0 || yy >= in_h) continue;
+                const int dj2 = dj * dj;
+                for(int di = -R; di <= R; di++)
+                {
+                    const int d2 = di * di + dj2;
+                    if(d2 == 0 || d2 > R2) continue;   // hors disque ou centre
+                    if(d2 >= best2)        continue;   // déjà pire
+                    const int xx = x + di;
+                    if(xx < 0 || xx >= in_w) continue;
+                    if(grad[yy * in_w + xx].conf > 0)
+                        best2 = d2;
+                }
+            }
+ 
+            if(best2 > R2) {
+                dist_map[i] = (int16_t)COUTURE_FAR;    // aucun net proche
+            } else {
+                float d = sqrtf((float)best2);
+                int df = (int)(d * (float)WEIGHT_MAX + 0.5f);
+                dist_map[i] = (int16_t)df;
+            }
+        }
+    }
+}
+
+
+
 static inline int aniso_pixel_plane(const unsigned char *src,
                                     int sx, int sy, int fx, int fy,
                                     int gx, int gy, int conf,
@@ -468,11 +606,11 @@ static inline int aniso_pixel_plane(const unsigned char *src,
     float ratio = 1.0f + (ANISO_RATIO - 1.0f) * (conf / (float)WEIGHT_MAX);
     const float ffx = fx / (float)WEIGHT_MAX;
     const float ffy = fy / (float)WEIGHT_MAX;
-
+ 
     int acc = 0, wsum = 0;
     int ws[36], vs[36];
     int n = 0;
-
+ 
     for(int dj = -2; dj <= 3; dj++)
     for(int di = -2; di <= 3; di++)
     {
@@ -481,34 +619,33 @@ static inline int aniso_pixel_plane(const unsigned char *src,
         float d_across = ddx*nx + ddy*ny;
         float d_along  = -ddx*ny + ddy*nx;
         float r = sqrtf(d_across*d_across + (d_along / ratio) * (d_along / ratio));
-
+ 
         int ri = (int)(r * WEIGHT_MAX + 0.5f);
         int ww = (ri < KAISER_RAD_SIZE) ? kaiser_rad_lut[ri] : 0;
         if(ww == 0) continue;
-
+ 
         int lx = sx + di, ly = sy + dj;
         lx = lx < 0 ? 0 : lx >= in_w ? in_w-1 : lx;
         ly = ly < 0 ? 0 : ly >= in_h ? in_h-1 : ly;
-
+ 
         int v = (bps == 1)
             ? ((int)src[ly*in_w + lx] << 8)
             : (int)((const uint16_t*)src)[ly*in_w + lx];
-
+ 
         ws[n] = ww;
         vs[n] = v;
         wsum += ww;
         n++;
     }
-
+ 
     if(wsum <= 0) return -1;
 
-    for(int i = 0; i < n; i++) {
-        int w_norm = (ws[i] * WEIGHT_MAX + wsum/2) / wsum;
-        acc += vs[i] * w_norm;
-    }
-    return acc >> WEIGHT_SHIFT;
+    long long acc_ll = 0;
+    for(int i = 0; i < n; i++)
+        acc_ll += (long long)vs[i] * ws[i];
+    return (int)(acc_ll / wsum);
 }
-
+ 
 static inline void aniso_pixel_rgb(const unsigned char *src,
                                    int sx, int sy, int fx, int fy,
                                    int gx, int gy, int conf,
@@ -516,14 +653,14 @@ static inline void aniso_pixel_rgb(const unsigned char *src,
                                    int *out0, int *out1, int *out2)
 {
     float glen = sqrtf((float)gx*gx + (float)gy*gy);
-	if(glen < 0.5f) glen = 0.5f;
+    if(glen < 0.5f) glen = 0.5f;
     float nx = gx / glen, ny = gy / glen;
     float ratio = 1.0f + (ANISO_RATIO - 1.0f) * (conf / (float)WEIGHT_MAX);
-
+ 
     const float ffx = fx / (float)WEIGHT_MAX;
     const float ffy = fy / (float)WEIGHT_MAX;
     const int bps3 = 3 * bps;
-
+ 
     int acc0 = 0, acc1 = 0, acc2 = 0, wsum = 0;
     for(int dj = -2; dj <= 3; dj++)
     for(int di = -2; di <= 3; di++)
@@ -532,16 +669,17 @@ static inline void aniso_pixel_rgb(const unsigned char *src,
         float d_across = ddx*nx + ddy*ny;
         float d_along  = -ddx*ny + ddy*nx;
         float r = sqrtf(d_across*d_across + (d_along / ratio) * (d_along / ratio));
-
+ 
         int ri = (int)(r * WEIGHT_MAX + 0.5f);
-        int w  = (ri < KAISER_RAD_SIZE) ? kaiser_rad_lut[ri] : 0;
+        int w;
+        w = (ri < KAISER_RAD_SIZE) ? kaiser_rad_lut[ri] : 0;
         if(w == 0) continue;
-
+ 
         int lx = sx + di, ly = sy + dj;
         lx = lx < 0 ? 0 : lx >= in_w ? in_w-1 : lx;
         ly = ly < 0 ? 0 : ly >= in_h ? in_h-1 : ly;
         const unsigned char *p = src + (ly*in_w + lx) * bps3;
-
+ 
         if(bps == 1) {
             acc0 += ((int)p[0] << 8)*w; acc1 += ((int)p[1] << 8)*w; acc2 += ((int)p[2] << 8)*w;
         } else {
@@ -553,7 +691,7 @@ static inline void aniso_pixel_rgb(const unsigned char *src,
     if(wsum > 0) {
         *out0 = acc0 / wsum; *out1 = acc1 / wsum; *out2 = acc2 / wsum;
     } else {
-        *out0 = *out1 = *out2 = 0;
+        *out0 = -1;   // signale le fallback à l'appelant
     }
 }
  
@@ -642,6 +780,7 @@ void usage(void)
 		"\t                     4 = exponential weighted 2D with temporal alternation\n"
 		"\t                     5 = kaiser 6x6 EWA isotropic\n"
 		"\t                     6 = kaiser 6x6 EWA anisotropic edge-directed\n"
+		"\t                     7 = kaiser 6x6 EWA aniso + selective softening\n"
         "\t--tmp-mode INT     temporal blending mode (default: 0)\n"
         "\t                     0 = duplicate frames (no blending)\n"
         "\t                     1 = blend 50%% on the upper minority of phases\n"
@@ -1311,12 +1450,15 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                              unsigned char * restrict out_plane,
                              const BresenhamMap * restrict map,
                              const Kernel2D * restrict k2d,
+							 const Kernel2D * restrict k2d_soft,
+							 const Kernel2D * restrict k2d_mid,
                              const int *tmp_weights,
                              const int in_w, const int in_h,
                              const int out_w, const int out_h,
                              const int ratio, const int mode,
                              const int bps_in, const int bps_out,
                              GradPixel * restrict grad,
+							 int16_t * restrict dist_map,
                              int aniso_strength_fp)
 {
     const int in_size       = in_w * in_h;
@@ -1333,8 +1475,12 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
         ((bps_in == 1) ? ((int)(row##_8)[x] << 8) \
                        : (int)((row##_16)[x]))
  
-    if(mode == 6)
+    if(mode == 6 || mode == 7)
+	{
         compute_gradient_plane(in_plane, grad, in_w, in_h, bps_in);
+		compute_conf_map(grad, in_w, in_h, mode, aniso_strength_fp);
+		compute_couture_dist(grad, dist_map, in_w, in_h);
+	}
  
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
@@ -1382,6 +1528,8 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
             if(use_2d_kernel)
             {
                 const Kernel2D *k_base = &k2d[FQ(fy) * NQUANT];
+				const Kernel2D *k_base_soft = (mode == 7) ? &k2d_soft[FQ(fy) * NQUANT] : k_base;
+				const Kernel2D *k_base_mid  = (mode == 7) ? &k2d_mid [FQ(fy)*NQUANT] : k_base;
  
                 for(int x = 0; x < out_w; x++)
                 {
@@ -1390,7 +1538,7 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
 					const int sx   = wpos >> WEIGHT_SHIFT;
 					const int fx = wpos & (WEIGHT_MAX - 1);
  
-                    if(mode == 6)
+                    if(mode == 6 || mode == 7)
                     {
                         // gradient interpolé bilinéairement
                         const int sx1 = sx + 1 < in_w ? sx + 1 : sx;
@@ -1410,37 +1558,99 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                         const int mag = (mg_t*(WEIGHT_MAX-fy) + mg_b*fy) >> WEIGHT_SHIFT;
  
                         int conf;
-                        if(mag <= ANISO_LOW)       conf = 0;
-                        else if(mag >= ANISO_HIGH) conf = WEIGHT_MAX;
-                        else conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
-                        conf = (conf * aniso_strength_fp) >> WEIGHT_SHIFT;
+						if(mode == 7) {
+							if(mag <= ANISO_LOW
+							   || is_compression_artifact(grad, sx, sy, mag, in_w, in_h)) {
+								conf = 0;                                   // doux
+							}
+							else if(mag >= ANISO_HIGH) {
+								conf = WEIGHT_MAX;
+							}
+							else {
+								conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+							}
+						}
+						else {  // mode 6
+							if(mag <= ANISO_LOW)       conf = 0;
+							else if(mag >= ANISO_HIGH) conf = WEIGHT_MAX;
+							else conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+						}
+						conf = (conf * aniso_strength_fp) >> WEIGHT_SHIFT;
  
                         int v;
                         if(conf == 0) {
-                            const Kernel2D *k = &k_base[FQ(fx)];
-                            const int ntaps = (int)k->n;
-                            int acc = 0;
-                            if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
-                                if(bps_in == 1) {
-                                    const unsigned char *c = src_plane + sy*in_w + sx;
-                                    for(int t=0;t<ntaps;t++) acc += ((int)c[k->ox[t]]<<8)*(int)k->w[t];
-                                } else {
-                                    const uint16_t *c = (const uint16_t*)src_plane + sy*in_w + sx;
-                                    for(int t=0;t<ntaps;t++) acc += (int)c[k->ox[t]]*(int)k->w[t];
-                                }
-                            } else {
-                                for(int t=0;t<ntaps;t++){
-                                    int lx=sx+k->dx[t], ly=sy+k->dy[t];
-                                    lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
-                                    int pv=(bps_in==1)?((int)src_plane[ly*in_w+lx]<<8)
-                                                      :(int)((const uint16_t*)src_plane)[ly*in_w+lx];
-                                    acc += pv*(int)k->w[t];
-                                }
-                            }
-                            v = acc >> WEIGHT_SHIFT;
-                        } else {
-                            v = aniso_pixel_plane(src_plane, sx, sy, fx, fy,
-                                                  igx, igy, conf, in_w, in_h, bps_in);
+							// distance à la couture, interpolée bilinéairement
+							const int d00 = dist_map[sy  * in_w + sx ];
+							const int d10 = dist_map[sy  * in_w + sx1];
+							const int d01 = dist_map[sy1 * in_w + sx ];
+							const int d11 = dist_map[sy1 * in_w + sx1];
+							const int d_t = (d00*(WEIGHT_MAX-fx) + d10*fx) >> WEIGHT_SHIFT;
+							const int d_b = (d01*(WEIGHT_MAX-fx) + d11*fx) >> WEIGHT_SHIFT;
+							const int d_fp = (d_t*(WEIGHT_MAX-fy) + d_b*fy) >> WEIGHT_SHIFT;
+
+							const int dmax = (COUTURE_N + 1) * WEIGHT_MAX;
+							// alpha = part de "mid" : 1 à la frontière (d=0), 0 au fond du soft
+							int alpha = (d_fp >= dmax) ? 0 : (WEIGHT_MAX - (d_fp * WEIGHT_MAX / dmax));
+
+							// valeur soft (curve)
+							int v_soft;
+							{
+								const Kernel2D *k = &k_base_soft[FQ(fx)];
+								const int ntaps = (int)k->n;
+								int acc = 0;
+								if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
+									if(bps_in == 1) {
+										const unsigned char *c = src_plane + sy*in_w + sx;
+										for(int t=0;t<ntaps;t++) acc += ((int)c[k->ox[t]]<<8)*(int)k->w[t];
+									} else {
+										const uint16_t *c = (const uint16_t*)src_plane + sy*in_w + sx;
+										for(int t=0;t<ntaps;t++) acc += (int)c[k->ox[t]]*(int)k->w[t];
+									}
+								} else {
+									for(int t=0;t<ntaps;t++){
+										int lx=sx+k->dx[t], ly=sy+k->dy[t];
+										lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
+										int pv=(bps_in==1)?((int)src_plane[ly*in_w+lx]<<8)
+														  :(int)((const uint16_t*)src_plane)[ly*in_w+lx];
+										acc += pv*(int)k->w[t];
+									}
+								}
+								v_soft = acc >> WEIGHT_SHIFT;
+							}
+
+							if(alpha == 0) {
+								v = v_soft;
+							} else {
+								// valeur mid (sinc r2 lobes réduits)
+								int v_mid;
+								{
+									const Kernel2D *k = &k_base_mid[FQ(fx)];
+									const int ntaps = (int)k->n;
+									int acc = 0;
+									if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
+										if(bps_in == 1) {
+											const unsigned char *c = src_plane + sy*in_w + sx;
+											for(int t=0;t<ntaps;t++) acc += ((int)c[k->ox[t]]<<8)*(int)k->w[t];
+										} else {
+											const uint16_t *c = (const uint16_t*)src_plane + sy*in_w + sx;
+											for(int t=0;t<ntaps;t++) acc += (int)c[k->ox[t]]*(int)k->w[t];
+										}
+									} else {
+										for(int t=0;t<ntaps;t++){
+											int lx=sx+k->dx[t], ly=sy+k->dy[t];
+											lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
+											int pv=(bps_in==1)?((int)src_plane[ly*in_w+lx]<<8)
+															  :(int)((const uint16_t*)src_plane)[ly*in_w+lx];
+											acc += pv*(int)k->w[t];
+										}
+									}
+									v_mid = acc >> WEIGHT_SHIFT;
+								}
+								v = (v_mid * alpha + v_soft * (WEIGHT_MAX - alpha)) >> WEIGHT_SHIFT;
+							}
+						} else {
+                                v = aniso_pixel_plane(src_plane, sx, sy, fx, fy, igx, igy, conf,
+													  in_w, in_h, bps_in);
                             if(v < 0) {
                                 const Kernel2D *k = &k_base[FQ(fx)];
                                 const int ntaps = (int)k->n;
@@ -1537,6 +1747,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
                       const int ratio, const int mode,
                       const int bps_in, const int bps_out,
                       GradPixel * restrict grad,
+					  int16_t * restrict dist_map,
                       int aniso_strength_fp)
 {
     const int in_w3         = in_w * 3;
@@ -1556,8 +1767,12 @@ void process_files_2d(const unsigned char * restrict in_buf,
         else ((uint16_t*)(ptr))[i]     = (uint16_t)_v; \
     } while(0)
  
-    if(mode == 6)
+    if(mode == 6 || mode == 7)
+	{
         compute_gradient_rgb(in_buf, grad, in_w, in_h, bps_in);
+		compute_conf_map(grad, in_w, in_h, mode, aniso_strength_fp);
+		compute_couture_dist(grad, dist_map, in_w, in_h);
+	}
  
     unsigned int offset = 0;
     for(int r = 0; r < ratio; r++)
@@ -1603,6 +1818,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
             if(use_2d_kernel)
             {
                 const Kernel2D *k_base = &k2d[FQ(fy) * NQUANT];
+				const Kernel2D *k_base_soft = (mode == 7) ? &curve_k2d[FQ(fy) * NQUANT] : k_base;
+				const Kernel2D *k_base_mid  = (mode == 7) ? &mid_k2d  [FQ(fy) * NQUANT] : k_base;
                 int x3 = 0;
                 for(int x = 0; x < out_w; x++, x3 += 3)
                 {
@@ -1610,7 +1827,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
 					const int sx   = wpos >> WEIGHT_SHIFT;
 					const int fx = wpos & (WEIGHT_MAX - 1);
  
-                    if(mode == 6)
+                    if(mode == 6 || mode == 7)
                     {
                         const int sx1 = sx + 1 < in_w ? sx + 1 : sx;
                         const int sy1 = sy + 1 < in_h ? sy + 1 : sy;
@@ -1629,34 +1846,94 @@ void process_files_2d(const unsigned char * restrict in_buf,
                         const int mag = (mg_t*(WEIGHT_MAX-fy) + mg_b*fy) >> WEIGHT_SHIFT;
  
                         int conf;
-                        if(mag <= ANISO_LOW)       conf = 0;
-                        else if(mag >= ANISO_HIGH) conf = WEIGHT_MAX;
-                        else conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
-                        conf = (conf * aniso_strength_fp) >> WEIGHT_SHIFT;
+						if(mode == 7) {
+							if(mag <= ANISO_LOW
+							   || is_compression_artifact(grad, sx, sy, mag, in_w, in_h)) {
+								conf = 0;                                   // doux
+							}
+							else if(mag >= ANISO_HIGH) {
+								conf = WEIGHT_MAX;
+							}
+							else {
+								conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+							}
+						}
+						else {  // mode 6
+							if(mag <= ANISO_LOW)       conf = 0;
+							else if(mag >= ANISO_HIGH) conf = WEIGHT_MAX;
+							else conf = (mag - ANISO_LOW) * WEIGHT_MAX / (ANISO_HIGH - ANISO_LOW);
+						}
+						conf = (conf * aniso_strength_fp) >> WEIGHT_SHIFT;
  
                         int v0, v1, v2;
                         if(conf == 0) {
-                            const Kernel2D *k = &k_base[FQ(fx)];
-                            const int ntaps = (int)k->n;
-                            int a0=0,a1=0,a2=0;
-                            if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
-                                const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
-                                for(int t=0;t<ntaps;t++){
-                                    const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
-                                    a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
-                                }
-                            } else {
-                                for(int t=0;t<ntaps;t++){
-                                    int lx=sx+k->dx[t],ly=sy+k->dy[t];
-                                    lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
-                                    const unsigned char *p=src_buf_ptr+(ly*in_w+lx)*bps3_in; int wt=(int)k->w[t];
-                                    a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
-                                }
-                            }
-                            v0=a0>>WEIGHT_SHIFT; v1=a1>>WEIGHT_SHIFT; v2=a2>>WEIGHT_SHIFT;
-                        } else {
-                            aniso_pixel_rgb(src_buf_ptr, sx, sy, fx, fy,
-                                            igx, igy, conf, in_w, in_h, bps_in, &v0, &v1, &v2);
+							const int d00 = dist_map[sy  * in_w + sx ];
+							const int d10 = dist_map[sy  * in_w + sx1];
+							const int d01 = dist_map[sy1 * in_w + sx ];
+							const int d11 = dist_map[sy1 * in_w + sx1];
+							const int d_t = (d00*(WEIGHT_MAX-fx) + d10*fx) >> WEIGHT_SHIFT;
+							const int d_b = (d01*(WEIGHT_MAX-fx) + d11*fx) >> WEIGHT_SHIFT;
+							const int d_fp = (d_t*(WEIGHT_MAX-fy) + d_b*fy) >> WEIGHT_SHIFT;
+
+							const int dmax = (COUTURE_N + 1) * WEIGHT_MAX;
+							int alpha = (d_fp >= dmax) ? 0 : (WEIGHT_MAX - (d_fp * WEIGHT_MAX / dmax));
+
+							// --- soft (curve), 3 canaux ---
+							int s0,s1,s2;
+							{
+								const Kernel2D *k = &k_base_soft[FQ(fx)];
+								const int ntaps = (int)k->n;
+								int a0=0,a1=0,a2=0;
+								if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
+									const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
+									for(int t=0;t<ntaps;t++){
+										const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
+										a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
+									}
+								} else {
+									for(int t=0;t<ntaps;t++){
+										int lx=sx+k->dx[t],ly=sy+k->dy[t];
+										lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
+										const unsigned char *p=src_buf_ptr+(ly*in_w+lx)*bps3_in; int wt=(int)k->w[t];
+										a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
+									}
+								}
+								s0=a0>>WEIGHT_SHIFT; s1=a1>>WEIGHT_SHIFT; s2=a2>>WEIGHT_SHIFT;
+							}
+
+							if(alpha == 0) {
+								v0=s0; v1=s1; v2=s2;
+							} else {
+								// --- mid (sinc r2 lobes réduits), 3 canaux ---
+								int m0,m1,m2;
+								{
+									const Kernel2D *k = &k_base_mid[FQ(fx)];
+									const int ntaps = (int)k->n;
+									int a0=0,a1=0,a2=0;
+									if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
+										const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
+										for(int t=0;t<ntaps;t++){
+											const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
+											a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
+										}
+									} else {
+										for(int t=0;t<ntaps;t++){
+											int lx=sx+k->dx[t],ly=sy+k->dy[t];
+											lx=lx<0?0:lx>=in_w?in_w-1:lx; ly=ly<0?0:ly>=in_h?in_h-1:ly;
+											const unsigned char *p=src_buf_ptr+(ly*in_w+lx)*bps3_in; int wt=(int)k->w[t];
+											a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
+										}
+									}
+									m0=a0>>WEIGHT_SHIFT; m1=a1>>WEIGHT_SHIFT; m2=a2>>WEIGHT_SHIFT;
+								}
+								const int ia = WEIGHT_MAX - alpha;
+								v0 = (m0*alpha + s0*ia) >> WEIGHT_SHIFT;
+								v1 = (m1*alpha + s1*ia) >> WEIGHT_SHIFT;
+								v2 = (m2*alpha + s2*ia) >> WEIGHT_SHIFT;
+							}
+						} else {
+                                aniso_pixel_rgb(src_buf_ptr, sx, sy, fx, fy, igx, igy, conf,
+												in_w, in_h, bps_in, &v0, &v1, &v2);
                             if(v0 < 0) {
                                 const Kernel2D *k = &k_base[FQ(fx)];
                                 const int ntaps = (int)k->n;
@@ -2064,7 +2341,7 @@ void *worker_loop(void *arg) {
 							a->map, a->tmp_weights,
 							a->in_w, a->in_h, a->out_w, a->out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->aniso_strength_fp);
+							a->grad, a->dist_map, a->aniso_strength_fp);
 						break;
 
                     case PIX_444P:
@@ -2079,11 +2356,13 @@ void *worker_loop(void *arg) {
 						process_files_2d_plane(
 							a->in_buf, a->next_buf, a->blend_buf, a->out_buf,
 							a->map,
-							(a->mode == 5 || a->mode == 6) ? kaiser_k2d : curve_k2d,
+							(a->mode >= 5) ? kaiser_k2d : curve_k2d,
+							curve_k2d,
+							mid_k2d,
 							a->tmp_weights,
 							a->in_w, a->in_h, a->out_w, a->out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->aniso_strength_fp);
+							a->grad, a->dist_map, a->aniso_strength_fp);
 
 						// U
 						process_files_2d_plane(
@@ -2092,11 +2371,13 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size,
 							a->out_buf   + out_y_size,
 							a->map_uv,
-							(a->mode == 5 || a->mode == 6) ? kaiser_k2d_uv : curve_k2d_uv,
+							(a->mode >= 5) ? kaiser_k2d_uv : curve_k2d_uv,
+							curve_k2d_uv,
+							mid_k2d_uv,
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->aniso_strength_fp);
+							a->grad, a->dist_map, a->aniso_strength_fp);
 
 						// V — même table que U
 						process_files_2d_plane(
@@ -2105,11 +2386,13 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size + in_uv_size,
 							a->out_buf   + out_y_size + out_uv_size,
 							a->map_uv,
-							(a->mode == 5 || a->mode == 6) ? kaiser_k2d_uv : curve_k2d_uv,
+							(a->mode >= 5) ? kaiser_k2d_uv : curve_k2d_uv,
+							curve_k2d_uv,
+							mid_k2d_uv,
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->aniso_strength_fp);
+							a->grad, a->dist_map, a->aniso_strength_fp);
                         break;
 
                     default:
@@ -2170,6 +2453,7 @@ int main(int argc, char **argv)
 	unsigned char *tmp_buf[NB_THREADS];
 	unsigned char *blend_buf[NB_THREADS];  // buffer du lerp temporel par worker
 	GradPixel *grad_buf[NB_THREADS];
+	int16_t   *dist_buf[NB_THREADS];
 		
 	for(int t=0; t<NB_THREADS; t++)
 	{
@@ -2178,6 +2462,7 @@ int main(int argc, char **argv)
 		tmp_buf[t]   = NULL;
 		blend_buf[t] = NULL;
 		grad_buf[t]  = NULL;
+		dist_buf[t]  = NULL;
 	}
 	in_buf[NB_THREADS] = NULL;
 	
@@ -2307,7 +2592,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(mode < 0 || mode > 6)
+	if(mode < 0 || mode > 7)
 	{
 		fprintf(stderr, "Error : mode '%d' is not supported\n", mode);
 		return -1;
@@ -2515,6 +2800,7 @@ int main(int argc, char **argv)
 			in_buf[t]    = ALIGNED_MALLOC(in_buf_length, 64);
 			out_buf[t]   = ALIGNED_MALLOC(out_buf_length, 64);
 			grad_buf[t] = ALIGNED_MALLOC(in_w * in_h * sizeof(GradPixel), 64);
+			dist_buf[t] = ALIGNED_MALLOC(in_w * in_h * sizeof(int16_t), 64);
 			
 			const int uv_out_w_alloc = (out_pix_fmt == PIX_444P || out_pix_fmt == PIX_444P16) ? out_w  :
 									   (out_pix_fmt == PIX_411P || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
@@ -2532,7 +2818,7 @@ int main(int argc, char **argv)
 			}
 
 			blend_buf[t] = ALIGNED_MALLOC(in_buf_length, 64);
-			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL || blend_buf[t] == NULL || grad_buf[t] == NULL)
+			if(in_buf[t] == NULL || out_buf[t] == NULL || tmp_buf[t] == NULL || blend_buf[t] == NULL || grad_buf[t] == NULL || dist_buf[t] == NULL)
 				alloc_err = 1;
 		}
 		// Slot supplémentaire pour le look-ahead temporel
@@ -2632,22 +2918,32 @@ int main(int argc, char **argv)
 					r, cw, out_w, 100.0*cw/out_w, ch, out_h, 100.0*ch/out_h);
 		}
 	}
-	else if(mode == 5 || mode == 6)
+	else if(mode == 5 || mode == 6 || mode == 7)
 	{
-		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
+		compute_curve_weights(&map, out_w, out_h, frames_ratio,
+							  CURVE_EXPONENTIAL, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_kaiser4_lut(kaiser_beta);
 		compute_kaiser_rad_lut(kaiser_beta, curve_base);
 		build_k2d(kaiser_k2d, kaiser_rad_lut, KAISER_RAD_SIZE, in_w);
 		if(need_map_uv)
-		{
 			build_k2d(kaiser_k2d_uv, kaiser_rad_lut, KAISER_RAD_SIZE, uv_in_w);
-		}
-		if(mode == 6)
-		{
-			build_aniso_mod();
+	 
+		if(mode == 7) {
+			// table douce : courbe exponentielle radius=1 (mode 4 style),
+			// cardinale, sans lobes → utilisée quand conf==0
+			compute_curve_rad_lut(4, curve_base);
+			compute_mid_rad_lut(kaiser_beta);
+			build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
+			build_k2d(mid_k2d, mid_rad_lut, MID_RAD_SIZE, in_w);
+			if(need_map_uv)
+			{
+				build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
+				build_k2d(mid_k2d_uv, mid_rad_lut, MID_RAD_SIZE, uv_in_w);
+			}
 		}
 	}
+
 	
 	if(need_map_uv)
 	{
@@ -2656,7 +2952,7 @@ int main(int argc, char **argv)
 		if(mode == 3) {
 			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_LINEAR, curve_base);
 			adjust_phase_direction_weighted(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
-		} else if(mode == 4 || mode == 5 || mode == 6) {
+		} else if(mode == 4 || mode == 5 || mode == 6 || mode == 7) {
 			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
 			adjust_phase_direction_weighted(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 		} else if(mode == 2) {
@@ -2684,7 +2980,8 @@ int main(int argc, char **argv)
 		args[t].bps_in  = (in_pix_fmt  >= PIX_RGB48) ? 2 : 1;
 		args[t].bps_out = (out_pix_fmt >= PIX_RGB48) ? 2 : 1;
 		args[t].map_uv = need_map_uv ? &map_uv : &map;
-		args[t].grad             = grad_buf[t];
+		args[t].grad        = grad_buf[t];
+		args[t].dist_map    = dist_buf[t];
 		args[t].aniso_strength_fp = (int)(aniso_strength * WEIGHT_MAX + 0.5);
 	}
 	
