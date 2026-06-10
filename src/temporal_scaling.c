@@ -90,10 +90,12 @@ struct ThreadArgs
 	const int *tmp_weights;    // poids temporel par phase (taille = ratio)
 	GradPixel *grad;
 	int16_t   *dist_map;
+	int        blur_artifact;
 	int aniso_strength_fp;  // 0..WEIGHT_MAX
 	int mode_1d;
 	PixFmt in_pix_fmt;
 	PixFmt out_pix_fmt;
+	int phase_v;
 	int bps_in;
 	int bps_out;
 	int in_w, in_h, out_w, out_h, ratio, mode;
@@ -116,6 +118,29 @@ static const int sobel5_x[5][5] = {
     { -4, -8, 0,  8,  4 },
     { -1, -2, 0,  2,  1 }
 };
+
+// ============================================================
+// RECONSTRUCTION DE TRANSITION
+//
+// Sur une bande de pixels source flaggés artefact (≥2 adjacents dans
+// un axe), on reconstruit une rampe smoothstep entre les deux pixels
+// fiables (non flaggés) qui bordent la bande. Les pixels libres de
+// l'upscale déroulent la transition en continu. Cardinalité préservée :
+// seuls les pixels flaggés (déjà non-cardinaux) sont réécrits.
+// ============================================================
+
+// LUT smoothstep : index = t en virgule fixe [0..WEIGHT_MAX],
+// valeur = 3t² − 2t³ en virgule fixe [0..WEIGHT_MAX].
+static int smoothstep_lut[WEIGHT_MAX + 1];
+
+void compute_smoothstep_lut(void)
+{
+    for(int i = 0; i <= WEIGHT_MAX; i++) {
+        double t = (double)i / (double)WEIGHT_MAX;
+        double s = t * t * (3.0 - 2.0 * t);
+        smoothstep_lut[i] = (int)(s * (double)WEIGHT_MAX + 0.5);
+    }
+}
 
 static inline int gsample(const unsigned char *src, int x, int y,
                           int w, int h, int bps)
@@ -213,10 +238,10 @@ void compute_kaiser4_lut(double beta)
 
 // LUT radiale pour kaiser 2D isotrope.
 // r dans [0 .. sqrt(2)*2] ≈ 2.83, indexé par r * WEIGHT_MAX
-#define KAISER_RAD_SIZE (4 * WEIGHT_MAX + 1)   // couvre sqrt(2)*3 ≈ 4.24
+#define KAISER_RAD_SIZE (5 * WEIGHT_MAX + 1)   // couvre sqrt(2)*3 ≈ 4.24
 static int kaiser_rad_lut[KAISER_RAD_SIZE];
 
-#define CURVE_RAD_SIZE (4 * WEIGHT_MAX + 1)
+#define CURVE_RAD_SIZE  (5 * WEIGHT_MAX + 1)
 static int curve_rad_lut[CURVE_RAD_SIZE];
 
 #define KERNEL_MAX_TAPS 24
@@ -758,6 +783,282 @@ void compute_curve_rad_lut(int mode, double base)
         int vi = (int)(v * (double)WEIGHT_MAX + 0.5);
         curve_rad_lut[ri] = vi < 0 ? 0 : vi;
     }
+}
+
+static inline int luma_at(const unsigned char *s,int x,int y,int w,int h,int bps,int rgb){
+    x=x<0?0:x>=w?w-1:x; y=y<0?0:y>=h?h-1:y;
+    if(rgb){ const unsigned char *p=s+(y*w+x)*3*bps;
+        if(bps==1) return (77*p[0]+150*p[1]+29*p[2])>>8;
+        const uint16_t *q=(const uint16_t*)p; return (77*(q[0]>>8)+150*(q[1]>>8)+29*(q[2]>>8))>>8; }
+    return (bps==1)? (int)s[y*w+x] : (int)((const uint16_t*)s)[y*w+x]>>8;
+}
+
+// Détecte la phase de grille verticale (frontières DCT) sur une frame.
+// Retourne la phase [0..7], ou -1 si aucune grille fiable détectée.
+static int compute_grid_phase(const unsigned char *src,
+                              int w, int h, int bps, int rgb)
+{
+    #define GRID_SHARP_MIN 1.30
+
+    long *profil_v = calloc(w, sizeof(long));
+    if(!profil_v) return -1;
+
+    #define LU(X,Y) luma_at(src,(X),(Y),w,h,bps,rgb)
+    // rupture de courbure horizontale par pixel, accumulée par colonne
+    for(int y = 0; y < h; y++) {
+        for(int x = 2; x < w - 2; x++) {
+            int gL = LU(x,y)   - LU(x-1,y);
+            int gR = LU(x+1,y) - LU(x,y);
+            int rupture = gR - gL;
+            if(rupture < 0) rupture = -rupture;
+            profil_v[x] += rupture;
+        }
+    }
+    #undef LU
+
+    // détection de phase : 8 décalages, on garde le max
+    long best = -1, sumall = 0; int phase = 0;
+    for(int phi = 0; phi < 8; phi++) {
+        long s = 0;
+        for(int x = phi; x < w; x += 8) s += profil_v[x];
+        sumall += s;
+        if(s > best) { best = s; phase = phi; }
+    }
+    double mean = (double)sumall / 8.0;
+    double sharp = (mean > 0) ? (double)best / mean : 0.0;
+
+    free(profil_v);
+
+    return (sharp >= GRID_SHARP_MIN) ? phase : -1;
+    #undef GRID_SHARP_MIN
+}
+
+// Post-passe de déblocking : floute horizontalement les colonnes de grille
+// dans l'image de sortie. Purement horizontal (même ligne uniquement),
+// donc le vertical interpolé par le scaling reste intact.
+// - estompage vers les bords de zone (pas de bordure nette)
+// - radius réduit sur fort contraste (pas de moyenne aberrante au milieu)
+static void post_deblock_rgb(unsigned char *out_buf,
+                             const BresenhamMap *map,
+                             int out_w, int out_h, int ratio,
+                             int bps_out, int phase_v)
+{
+    if(phase_v < 0) return;
+
+    const int bps3 = 3 * bps_out;
+    #define SRC_SPAN    2     // pixels source de chaque côté de la frontière
+    #define MAXOUT      8     // radius max du flou (faible contraste)
+    #define MAXOUT_MIN  2     // radius min du flou (fort contraste)
+    #define CONTRAST_LO 20    // sous ce contraste : radius max
+    #define CONTRAST_HI 80    // au-dessus : radius min
+    static const int exp_w[MAXOUT+1] = {256,128,64,32,16,8,4,2,1};
+
+    int *tmp = malloc(out_w * 3 * sizeof(int));
+    if(!tmp) return;
+
+    for(int f = 0; f < ratio; f++)
+    {
+        const int map_w_base = f * out_w;
+        unsigned char *frame = out_buf + (size_t)f * out_w * out_h * 3 * bps_out;
+
+        for(int y = 0; y < out_h; y++)
+        {
+            unsigned char *row = frame + (size_t)y * out_w * bps3;
+
+            for(int x = 0; x < out_w; x++)
+            {
+                int sx = map->w_src[map_w_base + x];
+                if(((sx - phase_v) % 8 + 8) % 8 != 0) continue;  // pas sur la grille
+
+                // étend de SRC_SPAN pixels source de chaque côté via changements de w_src
+                int lo = x, cnt = 0, prev = sx;
+                while(lo > 0 && cnt < SRC_SPAN) {
+                    lo--;
+                    int s = map->w_src[map_w_base + lo];
+                    if(s != prev) { cnt++; prev = s; }
+                }
+                int hi = x; cnt = 0; prev = sx;
+                while(hi < out_w-1 && cnt < SRC_SPAN) {
+                    hi++;
+                    int s = map->w_src[map_w_base + hi];
+                    if(s != prev) { cnt++; prev = s; }
+                }
+
+                // contraste à travers la zone (luma bord gauche vs bord droit)
+                int lum_lo, lum_hi;
+                {
+                    const unsigned char *pl = row + lo*bps3;
+                    const unsigned char *ph = row + hi*bps3;
+                    if(bps_out==1){
+                        lum_lo=(77*pl[0]+150*pl[1]+29*pl[2])>>8;
+                        lum_hi=(77*ph[0]+150*ph[1]+29*ph[2])>>8;
+                    } else {
+                        const uint16_t*ql=(const uint16_t*)pl;
+                        const uint16_t*qh=(const uint16_t*)ph;
+                        lum_lo=(77*(ql[0]>>8)+150*(ql[1]>>8)+29*(ql[2]>>8))>>8;
+                        lum_hi=(77*(qh[0]>>8)+150*(qh[1]>>8)+29*(qh[2]>>8))>>8;
+                    }
+                }
+                int contrast = lum_hi - lum_lo; if(contrast<0) contrast=-contrast;
+
+                // radius effectif : grand si contraste faible, petit si fort
+                int radius;
+                if(contrast <= CONTRAST_LO) radius = MAXOUT;
+                else if(contrast >= CONTRAST_HI) radius = MAXOUT_MIN;
+                else radius = MAXOUT_MIN +
+                     (MAXOUT - MAXOUT_MIN) * (CONTRAST_HI - contrast) / (CONTRAST_HI - CONTRAST_LO);
+
+                // floute chaque pixel de [lo..hi], avec estompage vers les bords
+                for(int px = lo; px <= hi; px++)
+                {
+                    int a0=0,a1=0,a2=0,wsum=0;
+                    for(int d = -radius; d <= radius; d++) {
+                        int lx = px + d;
+                        if(lx < lo) lx = lo; if(lx > hi) lx = hi;
+                        int wt = exp_w[d<0?-d:d];
+                        const unsigned char *p = row + lx*bps3;
+                        if(bps_out == 1) { a0+=p[0]*wt; a1+=p[1]*wt; a2+=p[2]*wt; }
+                        else { const uint16_t*q=(const uint16_t*)p; a0+=q[0]*wt; a1+=q[1]*wt; a2+=q[2]*wt; }
+                        wsum += wt;
+                    }
+                    int b0=a0/wsum, b1=a1/wsum, b2=a2/wsum;
+
+                    // estompage : 1 au centre (colonne de grille x), 0 aux bords
+                    int dc = px - x; if(dc < 0) dc = -dc;
+                    int span = (px <= x) ? (x - lo) : (hi - x);
+                    if(span < 1) span = 1;
+                    int aw = WEIGHT_MAX - (dc * WEIGHT_MAX / span);
+                    if(aw < 0) aw = 0; if(aw > WEIGHT_MAX) aw = WEIGHT_MAX;
+                    aw = smoothstep_lut[aw];
+                    int iaw = WEIGHT_MAX - aw;
+
+                    const unsigned char *po = row + px*bps3;
+                    int o0,o1,o2;
+                    if(bps_out==1){o0=po[0];o1=po[1];o2=po[2];}
+                    else{const uint16_t*q=(const uint16_t*)po;o0=q[0];o1=q[1];o2=q[2];}
+
+                    tmp[px*3+0]=(b0*aw+o0*iaw)>>WEIGHT_SHIFT;
+                    tmp[px*3+1]=(b1*aw+o1*iaw)>>WEIGHT_SHIFT;
+                    tmp[px*3+2]=(b2*aw+o2*iaw)>>WEIGHT_SHIFT;
+                }
+
+                // recopie séparée (ne pas flouter à partir de pixels déjà modifiés)
+                for(int px = lo; px <= hi; px++) {
+                    unsigned char *p = row + px*bps3;
+                    if(bps_out == 1) { p[0]=tmp[px*3]; p[1]=tmp[px*3+1]; p[2]=tmp[px*3+2]; }
+                    else { uint16_t*q=(uint16_t*)p; q[0]=tmp[px*3]; q[1]=tmp[px*3+1]; q[2]=tmp[px*3+2]; }
+                }
+
+                x = hi;
+            }
+        }
+    }
+    free(tmp);
+    #undef SRC_SPAN
+    #undef MAXOUT
+    #undef MAXOUT_MIN
+    #undef CONTRAST_LO
+    #undef CONTRAST_HI
+}
+
+// Post-passe de déblocking pour un plan (1 canal). Floute horizontalement
+// les colonnes de grille. Purement horizontal → vertical intact.
+static void post_deblock_plane(unsigned char *out_plane,
+                               const BresenhamMap *map,
+                               int out_w, int out_h, int ratio,
+                               int bps_out, int phase_v)
+{
+    if(phase_v < 0) return;
+
+    #define SRC_SPAN    2
+    #define MAXOUT      8
+    #define MAXOUT_MIN  2
+    #define CONTRAST_LO 20
+    #define CONTRAST_HI 80
+    static const int exp_w[MAXOUT+1] = {256,128,64,32,16,8,4,2,1};
+
+    int *tmp = malloc(out_w * sizeof(int));
+    if(!tmp) return;
+
+    for(int f = 0; f < ratio; f++)
+    {
+        const int map_w_base = f * out_w;
+        unsigned char *frame = out_plane + (size_t)f * out_w * out_h * bps_out;
+
+        for(int y = 0; y < out_h; y++)
+        {
+            unsigned char *row = frame + (size_t)y * out_w * bps_out;
+
+            #define RDP(px) ((bps_out==1) ? (int)row[px] : (int)((uint16_t*)row)[px])
+
+            for(int x = 0; x < out_w; x++)
+            {
+                int sx = map->w_src[map_w_base + x];
+                if(((sx - phase_v) % 8 + 8) % 8 != 0) continue;
+
+                int lo = x, cnt = 0, prev = sx;
+                while(lo > 0 && cnt < SRC_SPAN) {
+                    lo--;
+                    int s = map->w_src[map_w_base + lo];
+                    if(s != prev) { cnt++; prev = s; }
+                }
+                int hi = x; cnt = 0; prev = sx;
+                while(hi < out_w-1 && cnt < SRC_SPAN) {
+                    hi++;
+                    int s = map->w_src[map_w_base + hi];
+                    if(s != prev) { cnt++; prev = s; }
+                }
+
+                int contrast = RDP(hi) - RDP(lo); if(contrast<0) contrast=-contrast;
+                // note : contraste sur le plan, en échelle 16-bit si bps==2
+                int contrast8 = (bps_out==1) ? contrast : (contrast >> 8);
+
+                int radius;
+                if(contrast8 <= CONTRAST_LO) radius = MAXOUT;
+                else if(contrast8 >= CONTRAST_HI) radius = MAXOUT_MIN;
+                else radius = MAXOUT_MIN +
+                     (MAXOUT - MAXOUT_MIN) * (CONTRAST_HI - contrast8) / (CONTRAST_HI - CONTRAST_LO);
+
+                for(int px = lo; px <= hi; px++)
+                {
+                    int acc=0, wsum=0;
+                    for(int d = -radius; d <= radius; d++) {
+                        int lx = px + d;
+                        if(lx < lo) lx = lo; if(lx > hi) lx = hi;
+                        int wt = exp_w[d<0?-d:d];
+                        acc += RDP(lx)*wt;
+                        wsum += wt;
+                    }
+                    int b = acc/wsum;
+
+                    int dc = px - x; if(dc < 0) dc = -dc;
+                    int span = (px <= x) ? (x - lo) : (hi - x);
+                    if(span < 1) span = 1;
+                    int aw = WEIGHT_MAX - (dc * WEIGHT_MAX / span);
+                    if(aw < 0) aw = 0; if(aw > WEIGHT_MAX) aw = WEIGHT_MAX;
+                    aw = smoothstep_lut[aw];
+                    int iaw = WEIGHT_MAX - aw;
+
+                    int o = RDP(px);
+                    tmp[px] = (b*aw + o*iaw) >> WEIGHT_SHIFT;
+                }
+
+                for(int px = lo; px <= hi; px++) {
+                    if(bps_out==1) row[px] = (unsigned char)tmp[px];
+                    else ((uint16_t*)row)[px] = (uint16_t)tmp[px];
+                }
+
+                x = hi;
+            }
+            #undef RDP
+        }
+    }
+    free(tmp);
+    #undef SRC_SPAN
+    #undef MAXOUT
+    #undef MAXOUT_MIN
+    #undef CONTRAST_LO
+    #undef CONTRAST_HI
 }
 
 void usage(void)
@@ -1450,15 +1751,15 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                              unsigned char * restrict out_plane,
                              const BresenhamMap * restrict map,
                              const Kernel2D * restrict k2d,
-							 const Kernel2D * restrict k2d_soft,
-							 const Kernel2D * restrict k2d_mid,
+                             const Kernel2D * restrict k2d_soft,
+                             const Kernel2D * restrict k2d_mid,
                              const int *tmp_weights,
                              const int in_w, const int in_h,
                              const int out_w, const int out_h,
                              const int ratio, const int mode,
                              const int bps_in, const int bps_out,
                              GradPixel * restrict grad,
-							 int16_t * restrict dist_map,
+                             int16_t * restrict dist_map,
                              int aniso_strength_fp)
 {
     const int in_size       = in_w * in_h;
@@ -1475,9 +1776,9 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
         ((bps_in == 1) ? ((int)(row##_8)[x] << 8) \
                        : (int)((row##_16)[x]))
  
-    if(mode == 6 || mode == 7)
+	if(mode == 6 || mode == 7)
 	{
-        compute_gradient_plane(in_plane, grad, in_w, in_h, bps_in);
+		compute_gradient_plane(in_plane, grad, in_w, in_h, bps_in);
 		compute_conf_map(grad, in_w, in_h, mode, aniso_strength_fp);
 		compute_couture_dist(grad, dist_map, in_w, in_h);
 	}
@@ -1767,9 +2068,9 @@ void process_files_2d(const unsigned char * restrict in_buf,
         else ((uint16_t*)(ptr))[i]     = (uint16_t)_v; \
     } while(0)
  
-    if(mode == 6 || mode == 7)
+	if(mode == 6 || mode == 7)
 	{
-        compute_gradient_rgb(in_buf, grad, in_w, in_h, bps_in);
+		compute_gradient_rgb(in_buf, grad, in_w, in_h, bps_in);
 		compute_conf_map(grad, in_w, in_h, mode, aniso_strength_fp);
 		compute_couture_dist(grad, dist_map, in_w, in_h);
 	}
@@ -2341,7 +2642,12 @@ void *worker_loop(void *arg) {
 							a->map, a->tmp_weights,
 							a->in_w, a->in_h, a->out_w, a->out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->dist_map, a->aniso_strength_fp);
+							a->grad, a->dist_map,
+							a->aniso_strength_fp);
+						if(a->blur_artifact) {
+							const int phase = compute_grid_phase(a->in_buf, a->in_w, a->in_h, a->bps_in, 1);
+							post_deblock_rgb(a->out_buf, a->map, a->out_w, a->out_h, a->ratio, a->bps_out, phase);
+						}
 						break;
 
                     case PIX_444P:
@@ -2362,7 +2668,8 @@ void *worker_loop(void *arg) {
 							a->tmp_weights,
 							a->in_w, a->in_h, a->out_w, a->out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->dist_map, a->aniso_strength_fp);
+							a->grad, a->dist_map,
+							a->aniso_strength_fp);
 
 						// U
 						process_files_2d_plane(
@@ -2377,7 +2684,8 @@ void *worker_loop(void *arg) {
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->dist_map, a->aniso_strength_fp);
+							a->grad, a->dist_map,
+							a->aniso_strength_fp);
 
 						// V — même table que U
 						process_files_2d_plane(
@@ -2392,7 +2700,15 @@ void *worker_loop(void *arg) {
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
-							a->grad, a->dist_map, a->aniso_strength_fp);
+							a->grad, a->dist_map,
+							a->aniso_strength_fp);
+						
+						//luma only
+						if(a->blur_artifact) {
+						    int phase = compute_grid_phase(a->in_buf, a->in_w, a->in_h, a->bps_in, 0);
+						    post_deblock_plane(a->out_buf, a->map, a->out_w, a->out_h, a->ratio, a->bps_out, phase);
+						}
+
                         break;
 
                     default:
@@ -2441,6 +2757,7 @@ int main(int argc, char **argv)
 	int mode_1d = 0;  // défaut : 2D direct
 	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	double aniso_strength = 1.0;  // défaut : anisotropie pleine
+	int blur_artifact = 0;
 	
 	PixFmt in_pix_fmt  = PIX_RGB;
 	PixFmt out_pix_fmt = PIX_RGB;
@@ -2513,6 +2830,7 @@ int main(int argc, char **argv)
 		{"in-pix-fmt",  1, 0, 11},
 		{"out-pix-fmt", 1, 0, 12},
 		{"aniso-strength", 1, 0, 13},
+		{"blur-artifact", 0, 0, 14},
 		{0, 0, 0, 0}//reminder : letter value are from 65 to 122
 	};
 
@@ -2580,6 +2898,9 @@ int main(int argc, char **argv)
 		case 13:
 			aniso_strength = atof(optarg);
 			break;
+		case 14:
+			blur_artifact = 1;
+			break;
 		default:
 			usage();
 			break;
@@ -2598,9 +2919,14 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	
-	if(mode == 6 && mode_1d)
+	if(mode >= 6 && mode_1d)
 	{
 		fprintf(stderr, "Error: mode 6 requires 2D pipeline, --1d not supported\n");
+		return -1;
+	}
+	
+	if(blur_artifact && (mode < 3 || mode_1d)) {
+		fprintf(stderr, "Error: --blur-artifact requires mode >= 3 and the 2D pipeline (not --1d)\n");
 		return -1;
 	}
 	
@@ -2799,8 +3125,8 @@ int main(int argc, char **argv)
 		{
 			in_buf[t]    = ALIGNED_MALLOC(in_buf_length, 64);
 			out_buf[t]   = ALIGNED_MALLOC(out_buf_length, 64);
-			grad_buf[t] = ALIGNED_MALLOC(in_w * in_h * sizeof(GradPixel), 64);
-			dist_buf[t] = ALIGNED_MALLOC(in_w * in_h * sizeof(int16_t), 64);
+			grad_buf[t]  = ALIGNED_MALLOC(in_w * in_h * sizeof(GradPixel), 64);
+			dist_buf[t]  = ALIGNED_MALLOC(in_w * in_h * sizeof(int16_t), 64);
 			
 			const int uv_out_w_alloc = (out_pix_fmt == PIX_444P || out_pix_fmt == PIX_444P16) ? out_w  :
 									   (out_pix_fmt == PIX_411P || out_pix_fmt == PIX_410P)   ? out_w/4 : out_w/2;
@@ -2851,6 +3177,7 @@ int main(int argc, char **argv)
 				ALIGNED_FREE(tmp_buf[t]);
 				ALIGNED_FREE(blend_buf[t]);
 				ALIGNED_FREE(grad_buf[t]);
+				ALIGNED_FREE(dist_buf[t]);
 			}
 			ALIGNED_FREE(in_buf[NB_THREADS]);
 			fprintf(stderr, "ALIGNED_MALLOC error (buf)\n");
@@ -2865,6 +3192,8 @@ int main(int argc, char **argv)
 	
 	//compute the maping used for scaling the input image into an output one
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
+	
+	compute_smoothstep_lut();
 	
 	for(int r = 0; r < frames_ratio; r++) {
 		fprintf(stderr, "phase %d w_src : ", r);
@@ -2943,7 +3272,6 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-
 	
 	if(need_map_uv)
 	{
@@ -2982,6 +3310,7 @@ int main(int argc, char **argv)
 		args[t].map_uv = need_map_uv ? &map_uv : &map;
 		args[t].grad        = grad_buf[t];
 		args[t].dist_map    = dist_buf[t];
+		args[t].blur_artifact = blur_artifact;
 		args[t].aniso_strength_fp = (int)(aniso_strength * WEIGHT_MAX + 0.5);
 	}
 	
@@ -3143,6 +3472,7 @@ int main(int argc, char **argv)
 		ALIGNED_FREE(tmp_buf[t]);
 		ALIGNED_FREE(blend_buf[t]);
 		ALIGNED_FREE(grad_buf[t]);
+		ALIGNED_FREE(dist_buf[t]);
 	}
 	ALIGNED_FREE(in_buf[NB_THREADS]);
 	
