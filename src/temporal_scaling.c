@@ -39,7 +39,7 @@
 // Pondération en virgule fixe : poids stockés sur 0..WEIGHT_MAX
 #define WEIGHT_SHIFT 8
 #define WEIGHT_MAX   (1 << WEIGHT_SHIFT)
-#define CLAMP255(v)  ((v) < 0 ? 0 : (v) > 255 ? 255 : (v))  // ← ajouter ici
+#define CLAMP255(v)  ((v) < 0 ? 0 : (v) > 255 ? 255 : (v))
 
 typedef enum {
     PIX_RGB    = 0,
@@ -244,7 +244,7 @@ static int kaiser_rad_lut[KAISER_RAD_SIZE];
 #define CURVE_RAD_SIZE  (5 * WEIGHT_MAX + 1)
 static int curve_rad_lut[CURVE_RAD_SIZE];
 
-#define KERNEL_MAX_TAPS 24
+#define KERNEL_MAX_TAPS 36
 #define NQUANT_SHIFT 1   // log2(NQUANT / WEIGHT_MAX)
                           // 0 → NQUANT=256, 1 → NQUANT=512, 2 → NQUANT=1024
 
@@ -281,6 +281,10 @@ static Kernel2D kaiser_k2d   [NQUANT * NQUANT];
 static Kernel2D kaiser_k2d_uv[NQUANT * NQUANT];
 static Kernel2D curve_k2d    [NQUANT * NQUANT];
 static Kernel2D curve_k2d_uv [NQUANT * NQUANT];
+
+static int kaiser_rad_lut_soft[KAISER_RAD_SIZE];
+static Kernel2D kaiser_k2d_soft   [NQUANT * NQUANT];
+static Kernel2D kaiser_k2d_soft_uv[NQUANT * NQUANT];
 
 #define MID_RAD_SIZE  CURVE_RAD_SIZE          // même taille d'index que les autres
 #define MID_LOBE_GAIN 0.5                       // atténuation des lobes négatifs
@@ -363,8 +367,8 @@ static void build_k2d(Kernel2D *out, const int *rad_lut, int rad_size, int strid
     for(int fy_q = 0; fy_q < NQUANT; fy_q++)
     for(int fx_q = 0; fx_q < NQUANT; fx_q++)
     {
-        int fx = fx_q * WEIGHT_MAX / NQUANT;
-        int fy = fy_q * WEIGHT_MAX / NQUANT;
+        int fx = (fx_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
+        int fy = (fy_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
 
         int tw[36], tdx[36], tdy[36];
         int wsum = 0, n = 0;
@@ -401,9 +405,12 @@ static void build_k2d(Kernel2D *out, const int *rad_lut, int rad_size, int strid
             k->dy[i] = (int8_t)tdy[i];
         }
 
-        int wcheck = 0;
-        for(int i = 0; i < k->n; i++) wcheck += k->w[i];
-        if(k->n > 0) k->w[0] += (int16_t)(WEIGHT_MAX - wcheck);
+        int wcheck = 0, imax = 0;
+        for(int i = 0; i < k->n; i++) {
+            wcheck += k->w[i];
+            if(abs(k->w[i]) > abs(k->w[imax])) imax = i;
+        }
+        if(k->n > 0) k->w[imax] += (int16_t)(WEIGHT_MAX - wcheck);
     }
 }
 
@@ -720,38 +727,28 @@ static inline void aniso_pixel_rgb(const unsigned char *src,
     }
 }
  
-void compute_kaiser_rad_lut(double beta, double base)
+void compute_kaiser_rad_lut_into(int *lut, double beta, double base)
 {
-    const double radius = 3.0;
+    const double radius = 2.5;
     const double inv_i0 = 1.0 / bessel_i0(beta);
     const double denom  = pow(base, radius) - 1.0;
 
     for(int ri = 0; ri < KAISER_RAD_SIZE; ri++)
     {
         double r = (double)ri / (double)WEIGHT_MAX;
+        if(r >= radius) { lut[ri] = 0; continue; }
 
-        if(r >= radius) {
-            kaiser_rad_lut[ri] = 0;
-            continue;
-        }
-
-        // base cardinale : sinc radial (zéros aux entiers)
         double s;
         if(r == 0.0) s = 1.0;
         else { double px = M_PI * r; s = sin(px) / px; }
 
-        // fenêtre kaiser
         double k = bessel_i0(beta * sqrt(1.0 - (r/radius)*(r/radius))) * inv_i0;
-
-        // courbe exponentielle
         double curve = (pow(base, radius - r) - 1.0) / denom;
-
         double val = s * k * curve;
 
-        int vi = (val >= 0.0)
-               ?  (int)( val * (double)WEIGHT_MAX + 0.5)
-               : -(int)(-val * (double)WEIGHT_MAX + 0.5);
-        kaiser_rad_lut[ri] = vi;
+        int vi = (val >= 0.0) ?  (int)( val * WEIGHT_MAX + 0.5)
+                              : -(int)(-val * WEIGHT_MAX + 0.5);
+        lut[ri] = vi;
     }
 }
 
@@ -1310,6 +1307,58 @@ void compute_scale_map(BresenhamMap *map, int in_w, int in_h, int out_w, int out
         }
     }
 }
+/*
+// ============================================================
+// ANCRAGE CARDINAL : un pixel de sortie par pixel source à frac=0,
+// positions interpolées linéairement entre ancres (carte continue).
+// ============================================================
+static void anchor_axis(int *pos, int *srcm, int len, int in_len)
+{
+    int *anchor = malloc(in_len * sizeof(int));
+    if(!anchor) return;
+    for(int s = 0; s < in_len; s++) anchor[s] = -1;
+
+    for(int px = 0; px < len; px++) {
+        int s = pos[px] >> WEIGHT_SHIFT;
+        if(s < 0) s = 0;
+        if(s >= in_len) s = in_len - 1;
+        int target = s * WEIGHT_MAX;
+        if(anchor[s] < 0 || abs(pos[px] - target) < abs(pos[anchor[s]] - target))
+            anchor[s] = px;
+    }
+
+    int prev_px = -1, prev_s = -1;
+    for(int s = 0; s < in_len; s++) {
+        if(anchor[s] < 0) continue;
+        int cur_px = anchor[s];
+        pos[cur_px] = s * WEIGHT_MAX;
+        if(prev_px >= 0 && cur_px > prev_px + 1) {
+            int span = cur_px - prev_px;
+            long long dpos = (long long)(s - prev_s) * WEIGHT_MAX;
+            for(int px = prev_px + 1; px < cur_px; px++)
+                pos[px] = prev_s * WEIGHT_MAX
+                        + (int)((long long)(px - prev_px) * dpos / span);
+        }
+        prev_px = cur_px; prev_s = s;
+    }
+
+    const int max_pos = (in_len - 1) * WEIGHT_MAX;
+    for(int px = 0; px < len; px++) {
+        if(pos[px] < 0)       pos[px] = 0;
+        if(pos[px] > max_pos) pos[px] = max_pos;
+        srcm[px] = pos[px] >> WEIGHT_SHIFT;
+    }
+    free(anchor);
+}
+
+void anchor_cardinal_positions(BresenhamMap *map, int in_w, int in_h,
+                               int out_w, int out_h, int ratio)
+{
+    for(int r = 0; r < ratio; r++) {
+        anchor_axis(map->w_pos + r*out_w, map->w_src + r*out_w, out_w, in_w);
+        anchor_axis(map->h_pos + r*out_h, map->h_src + r*out_h, out_h, in_h);
+    }
+}*/
 
 typedef enum {
     CURVE_EXPONENTIAL = 0,  // mode 3
@@ -1990,7 +2039,8 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
                                 acc += pv*(int)k->w[t];
                             }
                         }
-                        WR(x, acc >> WEIGHT_SHIFT);
+                        int v = acc >> WEIGHT_SHIFT;
+                        WR(x, v);
                     }
                 }
             }
@@ -2099,7 +2149,8 @@ void process_files_2d(const unsigned char * restrict in_buf,
  
         const int map_w_base = r * out_w;
         const int map_h_base = r * out_h;
-        const Kernel2D *k2d = (mode >= 5) ? kaiser_k2d : curve_k2d;
+        const Kernel2D *k2d = (mode == 5) ? kaiser_k2d_soft
+                            : (mode >= 6) ? kaiser_k2d : curve_k2d;
  
         for(int y = 0; y < out_h; y++)
         {
@@ -2248,6 +2299,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
                                 v0=a0>>WEIGHT_SHIFT; v1=a1>>WEIGHT_SHIFT; v2=a2>>WEIGHT_SHIFT;
                             }
                         }
+						
                         WR3(dst_row, x3,   v0);
                         WR3(dst_row, x3+1, v1);
                         WR3(dst_row, x3+2, v2);
@@ -2271,9 +2323,10 @@ void process_files_2d(const unsigned char * restrict in_buf,
                                 a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
                             }
                         }
-                        WR3(dst_row,x3,  a0>>WEIGHT_SHIFT);
-                        WR3(dst_row,x3+1,a1>>WEIGHT_SHIFT);
-                        WR3(dst_row,x3+2,a2>>WEIGHT_SHIFT);
+                        int v0 = a0>>WEIGHT_SHIFT, v1 = a1>>WEIGHT_SHIFT, v2 = a2>>WEIGHT_SHIFT;
+                        WR3(dst_row,x3,  v0);
+                        WR3(dst_row,x3+1,v1);
+                        WR3(dst_row,x3+2,v2);
                     }
                 }
             }
@@ -2662,7 +2715,7 @@ void *worker_loop(void *arg) {
 						process_files_2d_plane(
 							a->in_buf, a->next_buf, a->blend_buf, a->out_buf,
 							a->map,
-							(a->mode >= 5) ? kaiser_k2d : curve_k2d,
+							(a->mode == 5) ? kaiser_k2d_soft : (a->mode >= 6) ? kaiser_k2d : curve_k2d,
 							curve_k2d,
 							mid_k2d,
 							a->tmp_weights,
@@ -2678,7 +2731,7 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size,
 							a->out_buf   + out_y_size,
 							a->map_uv,
-							(a->mode >= 5) ? kaiser_k2d_uv : curve_k2d_uv,
+							(a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv,
 							curve_k2d_uv,
 							mid_k2d_uv,
 							a->tmp_weights,
@@ -2694,7 +2747,7 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size + in_uv_size,
 							a->out_buf   + out_y_size + out_uv_size,
 							a->map_uv,
-							(a->mode >= 5) ? kaiser_k2d_uv : curve_k2d_uv,
+							(a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv,
 							curve_k2d_uv,
 							mid_k2d_uv,
 							a->tmp_weights,
@@ -3193,6 +3246,8 @@ int main(int argc, char **argv)
 	//compute the maping used for scaling the input image into an output one
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	
+	//anchor_cardinal_positions(&map, in_w, in_h, out_w, out_h, frames_ratio);
+	
 	compute_smoothstep_lut();
 	
 	for(int r = 0; r < frames_ratio; r++) {
@@ -3253,21 +3308,26 @@ int main(int argc, char **argv)
 							  CURVE_EXPONENTIAL, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_kaiser4_lut(kaiser_beta);
-		compute_kaiser_rad_lut(kaiser_beta, curve_base);
-		build_k2d(kaiser_k2d, kaiser_rad_lut, KAISER_RAD_SIZE, in_w);
+		compute_kaiser_rad_lut_into(kaiser_rad_lut, kaiser_beta, curve_base);
+		compute_kaiser_rad_lut_into(kaiser_rad_lut_soft, kaiser_beta, pow(curve_base, 1.0/3.0));
+		build_k2d(kaiser_k2d,      kaiser_rad_lut,      KAISER_RAD_SIZE, in_w);
+		build_k2d(kaiser_k2d_soft, kaiser_rad_lut_soft, KAISER_RAD_SIZE, in_w);
+		compute_curve_rad_lut(4, curve_base);
+		build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
 		if(need_map_uv)
-			build_k2d(kaiser_k2d_uv, kaiser_rad_lut, KAISER_RAD_SIZE, uv_in_w);
+		{
+			build_k2d(kaiser_k2d_uv,      kaiser_rad_lut,      KAISER_RAD_SIZE, uv_in_w);
+			build_k2d(kaiser_k2d_soft_uv, kaiser_rad_lut_soft, KAISER_RAD_SIZE, uv_in_w);
+			build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
+		}
 	 
 		if(mode == 7) {
 			// table douce : courbe exponentielle radius=1 (mode 4 style),
 			// cardinale, sans lobes → utilisée quand conf==0
-			compute_curve_rad_lut(4, curve_base);
 			compute_mid_rad_lut(kaiser_beta);
-			build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
 			build_k2d(mid_k2d, mid_rad_lut, MID_RAD_SIZE, in_w);
 			if(need_map_uv)
 			{
-				build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
 				build_k2d(mid_k2d_uv, mid_rad_lut, MID_RAD_SIZE, uv_in_w);
 			}
 		}
@@ -3276,6 +3336,8 @@ int main(int argc, char **argv)
 	if(need_map_uv)
 	{
 		compute_scale_map(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
+		
+		//anchor_cardinal_positions(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 
 		if(mode == 3) {
 			compute_curve_weights(&map_uv, uv_out_w, uv_out_h, frames_ratio, CURVE_LINEAR, curve_base);
