@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <getopt.h>
@@ -98,6 +99,7 @@ struct ThreadArgs
 	int phase_v;
 	int bps_in;
 	int bps_out;
+	int gpu_done;     // 1 = frame déjà mise à l'échelle par OpenCL (reste le post-traitement CPU)
 	int in_w, in_h, out_w, out_h, ratio, mode;
 };
 
@@ -362,55 +364,78 @@ static inline int is_compression_artifact(const GradPixel *grad,
 }
 
 
+// Calcule les taps non-nuls du noyau 2D pour la position fractionnaire
+// quantifiée (fy_q, fx_q). Partagé entre le chemin CPU (build_k2d) et le
+// chemin OpenCL (table dense) afin que les deux utilisent exactement les
+// mêmes poids. Retourne le nombre de taps.
+static int kernel_taps(const int *rad_lut, int rad_size, int fy_q, int fx_q,
+                       int16_t w_out[KERNEL_MAX_TAPS],
+                       int8_t dx_out[KERNEL_MAX_TAPS],
+                       int8_t dy_out[KERNEL_MAX_TAPS])
+{
+    int fx = (fx_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
+    int fy = (fy_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
+
+    int tw[36], tdx[36], tdy[36];
+    int wsum = 0, n = 0;
+
+    for(int dj = -2; dj <= 3; dj++)
+    for(int di = -2; di <= 3; di++)
+    {
+        float dxf = (float)fx / WEIGHT_MAX - di;
+        float dyf = (float)fy / WEIGHT_MAX - dj;
+        int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
+        int w  = (ri < rad_size) ? rad_lut[ri] : 0;
+        if(w != 0) {
+            tw [n] = w;
+            tdx[n] = di;
+            tdy[n] = dj;
+            wsum += w;
+            n++;
+        }
+    }
+
+    const int nn = n > KERNEL_MAX_TAPS ? KERNEL_MAX_TAPS : n;
+    for(int i = 0; i < nn; i++) {
+        long long num = (long long)tw[i] * WEIGHT_MAX;
+        w_out [i] = (int16_t)((num + (num >= 0 ? wsum/2 : -wsum/2)) / wsum);
+        dx_out[i] = (int8_t)tdx[i];
+        dy_out[i] = (int8_t)tdy[i];
+    }
+
+    int wcheck = 0, imax = 0;
+    for(int i = 0; i < nn; i++) {
+        wcheck += w_out[i];
+        if(abs(w_out[i]) > abs(w_out[imax])) imax = i;
+    }
+    if(nn > 0) w_out[imax] += (int16_t)(WEIGHT_MAX - wcheck);
+
+    return nn;
+}
+
 static void build_k2d(Kernel2D *out, const int *rad_lut, int rad_size, int stride)
 {
     for(int fy_q = 0; fy_q < NQUANT; fy_q++)
     for(int fx_q = 0; fx_q < NQUANT; fx_q++)
     {
-        int fx = (fx_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
-        int fy = (fy_q * WEIGHT_MAX + NQUANT/2) / NQUANT;
-
-        int tw[36], tdx[36], tdy[36];
-        int wsum = 0, n = 0;
-
-        for(int dj = -2; dj <= 3; dj++)
-        for(int di = -2; di <= 3; di++)
-        {
-            float dxf = (float)fx / WEIGHT_MAX - di;
-            float dyf = (float)fy / WEIGHT_MAX - dj;
-            int ri = (int)(sqrtf(dxf*dxf + dyf*dyf) * WEIGHT_MAX + 0.5f);
-            int w  = (ri < rad_size) ? rad_lut[ri] : 0;
-            if(w != 0) {
-                tw [n] = w;
-                tdx[n] = di;
-                tdy[n] = dj;
-                wsum += w;
-                n++;
-            }
-        }
+        int16_t tw[KERNEL_MAX_TAPS];
+        int8_t  tdx[KERNEL_MAX_TAPS], tdy[KERNEL_MAX_TAPS];
+        const int n = kernel_taps(rad_lut, rad_size, fy_q, fx_q, tw, tdx, tdy);
 
         int idx = fy_q * NQUANT + fx_q;
         Kernel2D *k = &out[idx];
-        k->n = (int8_t)(n > KERNEL_MAX_TAPS ? KERNEL_MAX_TAPS : n);
+        k->n = (int8_t)n;
         memset(k->w,  0, sizeof(k->w));
         memset(k->ox, 0, sizeof(k->ox));
         memset(k->dx, 0, sizeof(k->dx));
         memset(k->dy, 0, sizeof(k->dy));
 
-        for(int i = 0; i < k->n; i++) {
-            long long num = (long long)tw[i] * WEIGHT_MAX;
-            k->w [i] = (int16_t)((num + (num >= 0 ? wsum/2 : -wsum/2)) / wsum);
+        for(int i = 0; i < n; i++) {
+            k->w [i] = tw[i];
             k->ox[i] = (int16_t)(tdy[i] * stride + tdx[i]);
-            k->dx[i] = (int8_t)tdx[i];
-            k->dy[i] = (int8_t)tdy[i];
+            k->dx[i] = tdx[i];
+            k->dy[i] = tdy[i];
         }
-
-        int wcheck = 0, imax = 0;
-        for(int i = 0; i < k->n; i++) {
-            wcheck += k->w[i];
-            if(abs(k->w[i]) > abs(k->w[imax])) imax = i;
-        }
-        if(k->n > 0) k->w[imax] += (int16_t)(WEIGHT_MAX - wcheck);
     }
 }
 
@@ -445,7 +470,7 @@ static void compute_gradient_plane(const unsigned char *src,
                         gx += sobel5_x[dy][0]*row[0] + sobel5_x[dy][1]*row[1]
                             + sobel5_x[dy][3]*row[3] + sobel5_x[dy][4]*row[4];
                         gy += sobel5_x[0][dy]*row[0] + sobel5_x[1][dy]*row[1]
-                            + sobel5_x[3][dy]*row[3] + sobel5_x[4][dy]*row[4];
+                            + sobel5_x[2][dy]*row[2] + sobel5_x[3][dy]*row[3] + sobel5_x[4][dy]*row[4];
                     }
                 } else {
                     const uint16_t *row = (const uint16_t*)src + (y-2)*w + (x-2);
@@ -453,7 +478,7 @@ static void compute_gradient_plane(const unsigned char *src,
                         gx += sobel5_x[dy][0]*((int)row[0]>>8) + sobel5_x[dy][1]*((int)row[1]>>8)
                             + sobel5_x[dy][3]*((int)row[3]>>8) + sobel5_x[dy][4]*((int)row[4]>>8);
                         gy += sobel5_x[0][dy]*((int)row[0]>>8) + sobel5_x[1][dy]*((int)row[1]>>8)
-                            + sobel5_x[3][dy]*((int)row[3]>>8) + sobel5_x[4][dy]*((int)row[4]>>8);
+                            + sobel5_x[2][dy]*((int)row[2]>>8) + sobel5_x[3][dy]*((int)row[3]>>8) + sobel5_x[4][dy]*((int)row[4]>>8);
                     }
                 }
             }
@@ -499,21 +524,21 @@ static void compute_gradient_rgb(const unsigned char *src,
             }
             else
             {
-                // fast path : accès direct, colonne centrale skippée (=0)
+                // fast path : accès direct (colonne centrale nulle pour gx seulement)
                 if(bps == 1) {
                     const unsigned char *row = src + ((y-2)*w + (x-2)) * bps3;
                     const int stride = w * bps3;
                     for(int dy = 0; dy < 5; dy++, row += stride) {
-                        // luma des 5 pixels de la ligne (skip dx=2, coef=0)
+                        // luma des 5 pixels de la ligne
                         int v0 = (77*row[0]        + 150*row[1]        + 29*row[2])        >> 8;
                         int v1 = (77*row[3]        + 150*row[4]        + 29*row[5])        >> 8;
-                        // v2 = row[6..8] : colonne centrale, coef=0, skip
+                        int v2 = (77*row[6]        + 150*row[7]        + 29*row[8])        >> 8;
                         int v3 = (77*row[9]        + 150*row[10]       + 29*row[11])       >> 8;
                         int v4 = (77*row[12]       + 150*row[13]       + 29*row[14])       >> 8;
                         gx += sobel5_x[dy][0]*v0 + sobel5_x[dy][1]*v1
                             + sobel5_x[dy][3]*v3 + sobel5_x[dy][4]*v4;
                         gy += sobel5_x[0][dy]*v0 + sobel5_x[1][dy]*v1
-                            + sobel5_x[3][dy]*v3 + sobel5_x[4][dy]*v4;
+                            + sobel5_x[2][dy]*v2 + sobel5_x[3][dy]*v3 + sobel5_x[4][dy]*v4;
                     }
                 } else {
                     const uint16_t *row = (const uint16_t*)src + ((y-2)*w + (x-2)) * 3;
@@ -521,12 +546,13 @@ static void compute_gradient_rgb(const unsigned char *src,
                     for(int dy = 0; dy < 5; dy++, row += stride) {
                         int v0 = (77*(row[0]>>8) + 150*(row[1]>>8) + 29*(row[2]>>8)) >> 8;
                         int v1 = (77*(row[3]>>8) + 150*(row[4]>>8) + 29*(row[5]>>8)) >> 8;
+                        int v2 = (77*(row[6]>>8) + 150*(row[7]>>8) + 29*(row[8]>>8)) >> 8;
                         int v3 = (77*(row[9]>>8) + 150*(row[10]>>8)+ 29*(row[11]>>8))>> 8;
                         int v4 = (77*(row[12]>>8)+ 150*(row[13]>>8)+ 29*(row[14]>>8))>> 8;
                         gx += sobel5_x[dy][0]*v0 + sobel5_x[dy][1]*v1
                             + sobel5_x[dy][3]*v3 + sobel5_x[dy][4]*v4;
                         gy += sobel5_x[0][dy]*v0 + sobel5_x[1][dy]*v1
-                            + sobel5_x[3][dy]*v3 + sobel5_x[4][dy]*v4;
+                            + sobel5_x[2][dy]*v2 + sobel5_x[3][dy]*v3 + sobel5_x[4][dy]*v4;
                     }
                 }
             }
@@ -670,7 +696,7 @@ static inline int aniso_pixel_plane(const unsigned char *src,
         n++;
     }
  
-    if(wsum <= 0) return -1;
+    if(wsum <= 0) return INT_MIN;   // sentinelle : repli isotrope
 
     long long acc_ll = 0;
     for(int i = 0; i < n; i++)
@@ -723,7 +749,7 @@ static inline void aniso_pixel_rgb(const unsigned char *src,
     if(wsum > 0) {
         *out0 = acc0 / wsum; *out1 = acc1 / wsum; *out2 = acc2 / wsum;
     } else {
-        *out0 = -1;   // signale le fallback à l'appelant
+        *out0 = INT_MIN;   // sentinelle : repli isotrope
     }
 }
  
@@ -1058,6 +1084,27 @@ static void post_deblock_plane(unsigned char *out_plane,
     #undef CONTRAST_HI
 }
 
+// Backend OpenCL (header-only, chargement dynamique de la bibliothèque).
+// Doit venir après les constantes et build/kernel_taps ci-dessus.
+#include "temporal_scaling_ocl.h"
+#include "temporal_scaling_display.h"   // fenêtre OpenGL (Windows) pour --display
+#include "temporal_scaling_av.h"        // ffmpeg intégré (libav), si compilé avec -DTS_FFMPEG
+
+#ifdef TS_FFMPEG
+#define HAVE_AV 1
+#else
+typedef struct AvSrc AvSrc;   // jamais utilisé sans TS_FFMPEG
+#define HAVE_AV 0
+#endif
+
+#ifdef _WIN32
+#define POPEN  _popen
+#define PCLOSE _pclose
+#else
+#define POPEN  popen
+#define PCLOSE pclose
+#endif
+
 void usage(void)
 {
     fprintf(stderr,
@@ -1097,6 +1144,37 @@ void usage(void)
 		"\t--out-pix-fmt STR  output pixel format : RGB, 444p, 422p, 420p, 411p, 410p,\n"
 		"\t                   RGB48, 444p16, 422p16, 420p16\n"
 		"                     RGB<->YUV conversion not supported\n"
+		"\t--opencl          scale on the GPU through OpenCL (Intel/AMD/NVIDIA),\n"
+		"\t                   falls back to the CPU if no usable device is found.\n"
+		"\t                   2D pipeline only (not with --1d)\n"
+		"\t--ocl-device INT   OpenCL device index (default: best GPU), see --ocl-list\n"
+		"\t--ocl-list         list OpenCL devices and exit\n"
+		"\t--display          show the result in a window instead of writing to stdout\n"
+		"\t                   (Windows, needs --opencl and --out-pix-fmt RGB/RGB48)\n"
+		"\t                   keys: Esc quit, F/F11 fullscreen, Space pause\n"
+		"\t--display-fps FLT  display rate of the output frames (default: 60)\n"
+		"\t--source FILE      read and decode FILE inside the program (ffmpeg libraries, no pipe),\n"
+		"\t                   the input size is detected; needs a build with -DTS_FFMPEG.\n"
+		"\t                   With --display the sound of FILE is played and the picture is\n"
+		"\t                   synchronised on the timestamps (no --display-fps needed)\n"
+		"\t--vf STR           libavfilter chain applied to the source, e.g. \"bwdif=1\" to deinterlace\n"
+		"\t--no-audio         do not play the sound of --source\n"
+		"\t--deint ALGO:RATE  with --source: choose the deinterlacer, e.g. 1:2 (bwdif, one image per\n"
+		"\t                   field = double rate), 2:1 (yadif, one image per frame = same rate).\n"
+		"\t                   Anything else is used as an ffmpeg filter chain. Default: automatic\n"
+		"\t                   (1:2 when the video is interlaced). See --deint-list\n"
+		"\t--deint-list       list the deinterlacing algorithms and exit\n"
+		"\t--no-deint         with --source: no deinterlacing at all\n"
+		"\t                   With --source, give only --out-height (or --out-width): the other size\n"
+		"\t                   follows the display aspect ratio. The picture is scaled 4:2:0 -> 4:4:4 and,\n"
+		"\t                   unless --out-pix-fmt 444p is given, converted to RGB (on the GPU with --opencl)\n"
+		"\t--audio FILE       play the sound of FILE with --display (uses ffmpeg), the sound\n"
+		"\t                   is the master clock: late frames are dropped to stay in sync\n"
+		"\t--audio-cmd STR    same, from a command writing raw PCM s16le 48000 Hz stereo\n"
+		"\t--audio-offset MS  shift the picture relative to the sound (default: 0)\n"
+		"\t--input-cmd STR    read the raw video from the stdout of a command, e.g.\n"
+		"\t                   --input-cmd \"ffmpeg -v error -i in.mkv -vf yadif -pix_fmt rgb24 -f rawvideo -\"\n"
+		"\t                   (replaces -i)\n"
     );
     exit(1);
 }
@@ -2001,7 +2079,7 @@ void process_files_2d_plane(const unsigned char * restrict in_plane,
 						} else {
                                 v = aniso_pixel_plane(src_plane, sx, sy, fx, fy, igx, igy, conf,
 													  in_w, in_h, bps_in);
-                            if(v < 0) {
+                            if(v == INT_MIN) {
                                 const Kernel2D *k = &k_base[FQ(fx)];
                                 const int ntaps = (int)k->n;
                                 int acc = 0;
@@ -2237,7 +2315,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
 								const int ntaps = (int)k->n;
 								int a0=0,a1=0,a2=0;
 								if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
-									const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
+									const unsigned char *c = src_buf_ptr + sy*in_w3*bps_in + sx*bps3_in;
 									for(int t=0;t<ntaps;t++){
 										const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
 										a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
@@ -2263,7 +2341,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
 									const int ntaps = (int)k->n;
 									int a0=0,a1=0,a2=0;
 									if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
-										const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
+										const unsigned char *c = src_buf_ptr + sy*in_w3*bps_in + sx*bps3_in;
 										for(int t=0;t<ntaps;t++){
 											const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
 											a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
@@ -2286,7 +2364,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
 						} else {
                                 aniso_pixel_rgb(src_buf_ptr, sx, sy, fx, fy, igx, igy, conf,
 												in_w, in_h, bps_in, &v0, &v1, &v2);
-                            if(v0 < 0) {
+                            if(v0 == INT_MIN) {
                                 const Kernel2D *k = &k_base[FQ(fx)];
                                 const int ntaps = (int)k->n;
                                 int a0=0,a1=0,a2=0;
@@ -2310,7 +2388,7 @@ void process_files_2d(const unsigned char * restrict in_buf,
                         const int ntaps = (int)k->n;
                         int a0=0,a1=0,a2=0;
                         if(sx>=2 && sx+3<in_w && sy>=2 && sy+3<in_h) {
-                            const unsigned char *c = src_buf_ptr + sy*in_w3 + sx*bps3_in;
+                            const unsigned char *c = src_buf_ptr + sy*in_w3*bps_in + sx*bps3_in;
                             for(int t=0;t<ntaps;t++){
                                 const unsigned char *p=c+k->ox[t]*bps3_in; int wt=(int)k->w[t];
                                 a0+=RD3(p,0)*wt; a1+=RD3(p,1)*wt; a2+=RD3(p,2)*wt;
@@ -2596,6 +2674,9 @@ void process_files(const unsigned char * restrict in_buf,
 //   tmp_buf : [Y plane : out_w*in_h] [U plane] [V plane]
 //   blend_buf: [Y plane : in_w*in_h] [U plane] [V plane]
  
+// 444->444 : pas de carte chroma séparée, donc pas de tables _uv (identiques à celles de la luma).
+#define UVTAB(a, ytab, uvtab) (((a)->map_uv == (a)->map) ? (ytab) : (uvtab))
+
 void *worker_loop(void *arg) {
     Worker *w = (Worker *)arg;
     while (1) {
@@ -2610,7 +2691,21 @@ void *worker_loop(void *arg) {
 
         ThreadArgs *a = &w->args;
 
-        const int uv_in_w  = (a->in_pix_fmt  == PIX_444P || a->in_pix_fmt  == PIX_444P16) ? a->in_w    :
+        // Frame déjà traitée par le GPU : il ne reste que le déblocking (CPU).
+        if(a->gpu_done) {
+            if(a->blur_artifact) {
+                if(a->in_pix_fmt == PIX_RGB || a->in_pix_fmt == PIX_RGB48) {
+                    const int phase = compute_grid_phase(a->in_buf, a->in_w, a->in_h, a->bps_in, 1);
+                    post_deblock_rgb(a->out_buf, a->map, a->out_w, a->out_h, a->ratio, a->bps_out, phase);
+                } else {
+                    const int phase = compute_grid_phase(a->in_buf, a->in_w, a->in_h, a->bps_in, 0);
+                    post_deblock_plane(a->out_buf, a->map, a->out_w, a->out_h, a->ratio, a->bps_out, phase);
+                }
+            }
+            goto worker_done;
+        }
+
+        const int uv_in_w  =(a->in_pix_fmt  == PIX_444P || a->in_pix_fmt  == PIX_444P16) ? a->in_w    :
 							 (a->in_pix_fmt  == PIX_411P  || a->in_pix_fmt  == PIX_410P)  ? a->in_w/4  : a->in_w/2;
 		const int uv_in_h  = (a->in_pix_fmt  == PIX_420P  || a->in_pix_fmt  == PIX_420P16) ? a->in_h/2 :
 							 (a->in_pix_fmt  == PIX_410P)                                  ? a->in_h/4 : a->in_h;
@@ -2731,9 +2826,9 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size,
 							a->out_buf   + out_y_size,
 							a->map_uv,
-							(a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv,
-							curve_k2d_uv,
-							mid_k2d_uv,
+							UVTAB(a, (a->mode == 5) ? kaiser_k2d_soft : (a->mode >= 6) ? kaiser_k2d : curve_k2d, (a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv),
+							UVTAB(a, curve_k2d, curve_k2d_uv),
+							UVTAB(a, mid_k2d, mid_k2d_uv),
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
@@ -2747,9 +2842,9 @@ void *worker_loop(void *arg) {
 							a->blend_buf + in_y_size + in_uv_size,
 							a->out_buf   + out_y_size + out_uv_size,
 							a->map_uv,
-							(a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv,
-							curve_k2d_uv,
-							mid_k2d_uv,
+							UVTAB(a, (a->mode == 5) ? kaiser_k2d_soft : (a->mode >= 6) ? kaiser_k2d : curve_k2d, (a->mode == 5) ? kaiser_k2d_soft_uv : (a->mode >= 6) ? kaiser_k2d_uv : curve_k2d_uv),
+							UVTAB(a, curve_k2d, curve_k2d_uv),
+							UVTAB(a, mid_k2d, mid_k2d_uv),
 							a->tmp_weights,
 							uv_in_w, uv_in_h, uv_out_w, uv_out_h,
 							a->ratio, a->mode, a->bps_in, a->bps_out,
@@ -2770,6 +2865,7 @@ void *worker_loop(void *arg) {
                 break;
         }
 
+worker_done:
         pthread_mutex_lock(&w->mutex);
         w->done = 1;
         pthread_cond_signal(&w->cond_done);
@@ -2778,6 +2874,321 @@ void *worker_loop(void *arg) {
     return NULL;
 }
 
+// ============================================================
+// Pipeline OpenCL continu : 3 étages qui tournent en même temps
+//   lecture (thread) -> GPU (thread principal) -> déblocking + écriture (thread)
+// Les images circulent dans un anneau de GS_RING emplacements (in_buf/out_buf).
+// Débit = étage le plus lent, au lieu de la somme des trois, et pas de
+// rafales de 16 images en sortie (cause de saccades en lecture temps réel).
+// ============================================================
+#define GS_RING 6
+
+typedef struct {
+    FILE *input;
+    unsigned char **in_buf, **out_buf;
+    unsigned in_len, out_len;
+    int in_w, in_h, out_w, out_h, bps_in, bps_out, ratio, blur;
+    int display; double disp_fps;   // --display : afficher au lieu d'écrire sur stdout
+    FILE *audio; double audio_offset;   // flux PCM pour --display
+    AvSrc *av;                          // source libav (--source) ou NULL
+    double pts[GS_RING];                // horodatage (s) de chaque image d'entrée de l'anneau
+    double frame_dur;                   // durée d'une image d'entrée (s)
+    int ring_limit;                     // images d'avance max (réduit en mode lecteur pour limiter le retard)
+    PixFmt in_fmt, out_fmt;
+    const BresenhamMap *map;
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    long read_cnt, gpu_cnt, write_cnt;
+    int  eof, gpu_finished;
+} GpuStream;
+
+static void *gs_reader(void *p)
+{
+    GpuStream *g = (GpuStream *)p;
+    for(;;)
+    {
+        pthread_mutex_lock(&g->m);
+        while(g->read_cnt - g->write_cnt >= g->ring_limit)
+            pthread_cond_wait(&g->c, &g->m);
+        const long k = g->read_cnt;
+        pthread_mutex_unlock(&g->m);
+
+        int ok;
+        double pts = -1.0;
+#ifdef TS_FFMPEG
+        if(g->av) ok = ts_av_read(g->av, g->in_buf[k % GS_RING], &pts);
+        else
+#endif
+        ok = (fread(g->in_buf[k % GS_RING], g->in_len, 1, g->input) == 1);
+
+        pthread_mutex_lock(&g->m);
+        if(ok) {
+            g->pts[k % GS_RING] = pts;
+#ifdef TS_FFMPEG
+            if(g->av) g->frame_dur = g->av->frame_dur;
+#endif
+            g->read_cnt++;
+        } else g->eof = 1;
+        pthread_cond_broadcast(&g->c);
+        pthread_mutex_unlock(&g->m);
+        if(!ok) break;
+    }
+    return NULL;
+}
+
+static void *gs_writer(void *p)
+{
+    GpuStream *g = (GpuStream *)p;
+    const int is_rgb_out = (g->out_fmt == PIX_RGB || g->out_fmt == PIX_RGB48);
+    const int is_rgb_in  = (g->in_fmt  == PIX_RGB || g->in_fmt  == PIX_RGB48);
+    const int uv_out_w = (g->out_fmt == PIX_444P || g->out_fmt == PIX_444P16) ? g->out_w   :
+                         (g->out_fmt == PIX_411P || g->out_fmt == PIX_410P)   ? g->out_w/4 : g->out_w/2;
+    const int uv_out_h = (g->out_fmt == PIX_420P || g->out_fmt == PIX_420P16) ? g->out_h/2 :
+                         (g->out_fmt == PIX_410P)                             ? g->out_h/4 : g->out_h;
+
+#ifdef _WIN32
+    if(g->display && disp_init(g->out_w, g->out_h, g->bps_out, g->disp_fps) != 0) {
+        fprintf(stderr, "Display: initialisation failed\n");
+        exit(1);
+    }
+#ifdef TS_FFMPEG
+    if(g->display && g->av && g->av->has_audio) {
+        if(disp_audio_init_ex(NULL, ts_av_audio_read, ts_av_audio_pts0, g->av, g->audio_offset) != 0)
+            fprintf(stderr, "Audio: disabled, playing without sound\n");
+    } else
+#endif
+    if(g->display && g->audio && disp_audio_init(g->audio, g->audio_offset) != 0)
+        fprintf(stderr, "Audio: disabled, playing without sound\n");
+#endif
+
+    for(;;)
+    {
+        pthread_mutex_lock(&g->m);
+        while(g->write_cnt >= g->gpu_cnt && !g->gpu_finished)
+            pthread_cond_wait(&g->c, &g->m);
+        if(g->write_cnt >= g->gpu_cnt) { pthread_mutex_unlock(&g->m); break; }
+        const long k = g->write_cnt;
+        pthread_mutex_unlock(&g->m);
+
+        unsigned char *in  = g->in_buf [k % GS_RING];
+        unsigned char *out = g->out_buf[k % GS_RING];
+
+        if(g->blur) {
+            const int phase = compute_grid_phase(in, g->in_w, g->in_h, g->bps_in, is_rgb_in);
+            if(is_rgb_out) post_deblock_rgb  (out, g->map, g->out_w, g->out_h, g->ratio, g->bps_out, phase);
+            else          post_deblock_plane(out, g->map, g->out_w, g->out_h, g->ratio, g->bps_out, phase);
+        }
+
+#ifdef _WIN32
+        if(g->display)
+        {
+            // affichage direct : une frame de sortie à la fois, à la cadence demandée
+            const size_t fb = (size_t)g->out_w * g->out_h * 3 * g->bps_out;
+            // horodatage de la frame de sortie f (mode lecteur) ; <0 = cadence fixe
+            double base_pts, fdur;
+            pthread_mutex_lock(&g->m);
+            base_pts = g->pts[k % GS_RING];
+            fdur = g->frame_dur;
+            pthread_mutex_unlock(&g->m);
+            const double step = (g->av && fdur > 0.0) ? fdur / g->ratio : 0.0;
+            for(int f = 0; f < g->ratio; f++) {
+                const double pf = (g->av && base_pts >= 0.0 && step > 0.0) ? base_pts + f * step : -1.0;
+                if(!disp_present(out + f * fb, pf, step)) {   // fenêtre fermée / Echap
+                    disp_close();
+                    fflush(stderr);
+                    exit(0);
+                }
+            }
+        }
+        else
+#endif
+        if(!isatty(STDOUT_FILENO))
+        {
+            if(is_rgb_out) {
+                fwrite(out, g->out_len, 1, stdout);
+            } else {
+                const size_t fy = (size_t)g->out_w * g->out_h * g->bps_out;
+                const size_t fuv = (size_t)uv_out_w * uv_out_h * g->bps_out;
+                for(int f = 0; f < g->ratio; f++) {
+                    fwrite(out + f * fy,                                     fy,  1, stdout);
+                    fwrite(out + fy * g->ratio + f * fuv,                    fuv, 1, stdout);
+                    fwrite(out + fy * g->ratio + fuv * g->ratio + f * fuv,   fuv, 1, stdout);
+                }
+            }
+            fflush(stdout);
+        }
+
+        pthread_mutex_lock(&g->m);
+        g->write_cnt++;
+        pthread_cond_broadcast(&g->c);
+        pthread_mutex_unlock(&g->m);
+    }
+#ifdef _WIN32
+    if(g->display) disp_close();
+#endif
+    return NULL;
+}
+
+static void gpu_stream_run(GpuStream *g)
+{
+    pthread_t rd, wr;
+    g->ring_limit = g->av ? 4 : GS_RING;
+    pthread_mutex_init(&g->m, NULL);
+    pthread_cond_init(&g->c, NULL);
+    pthread_create(&rd, NULL, gs_reader, g);
+    pthread_create(&wr, NULL, gs_writer, g);
+
+    // La frame k est soumise au GPU avant d'attendre la fin de k-1 : le GPU
+    // enchaîne les images sans repasser par le CPU (pas de temps mort).
+    ocl_event pending = NULL;
+    double ema_dt = 0.0, last_c = 0.0;
+    long prev_completed = 0;
+    for(long k = 0; ; k++)
+    {
+        // il faut la frame k et si possible k+1 (fondu temporel)
+        pthread_mutex_lock(&g->m);
+        while(!(g->read_cnt > k + 1 || g->eof))
+            pthread_cond_wait(&g->c, &g->m);
+        const int have = (g->read_cnt > k);
+        const int has_next = (g->read_cnt > k + 1);
+        pthread_mutex_unlock(&g->m);
+        if(!have) break;
+
+        const unsigned char *in   = g->in_buf[k % GS_RING];
+        const unsigned char *next = has_next ? g->in_buf[(k + 1) % GS_RING] : in;
+        ocl_event ev = NULL;
+        if(ocl_submit_frame(in, next, g->out_buf[k % GS_RING], &ev) != 0) {
+            fprintf(stderr, "OpenCL: frame processing failed, aborting\n");
+            exit(1);
+        }
+
+        // Frames terminées : en asynchrone, k-1 (on attend sa fin maintenant
+        // que k est déjà parti) ; en synchrone (profil), k elle-même.
+        long completed;
+        if(ev) {
+            if(ocl_wait_frame(pending) != 0) { fprintf(stderr, "OpenCL: aborting\n"); exit(1); }
+            pending = ev;
+            completed = k;
+        } else {
+            completed = k + 1;
+        }
+#ifdef TS_FFMPEG
+        // Retard actuel de la file (images en attente x durée GPU par image) : le
+        // décodeur s'en sert pour n'envoyer que des images qui seront à l'heure.
+        if(completed > prev_completed) {
+            const double tn = ocl_now();
+            if(last_c > 0.0) {
+                const double dt = (tn - last_c) / (double)(completed - prev_completed);
+                ema_dt = ema_dt > 0.0 ? 0.8 * ema_dt + 0.2 * dt : dt;
+            }
+            last_c = tn;
+            prev_completed = completed;
+        }
+        ts_av_lead_s = (double)(g->read_cnt - completed) * ema_dt;
+#endif
+        pthread_mutex_lock(&g->m);
+        g->gpu_cnt = completed;
+        pthread_cond_broadcast(&g->c);
+        pthread_mutex_unlock(&g->m);
+    }
+
+    // dernière frame en vol
+    if(ocl_wait_frame(pending) != 0) { fprintf(stderr, "OpenCL: aborting\n"); exit(1); }
+    pthread_mutex_lock(&g->m);
+    g->gpu_cnt = g->read_cnt;   // toutes les frames lues sont maintenant terminées
+    g->gpu_finished = 1;
+    pthread_cond_broadcast(&g->c);
+    pthread_mutex_unlock(&g->m);
+    pthread_join(rd, NULL);
+    pthread_join(wr, NULL);
+    pthread_mutex_destroy(&g->m);
+    pthread_cond_destroy(&g->c);
+}
+
+// Désentrelacement : --deint ALGO:CADENCE  (ou chaîne ffmpeg libre).
+//   ALGO    = numéro de l'algorithme (liste ci-dessous, --deint-list)
+//   CADENCE = 1 : une image par trame (même cadence)
+//             2 : une image par champ (cadence doublée, mouvement plus fluide)
+//   "ALGO" seul = "ALGO:2".
+typedef struct {
+    const char *one;    // chaîne pour la cadence 1 ("" = sans objet)
+    const char *two;    // chaîne pour la cadence 2
+    const char *info;
+} DeintAlgo;
+static const DeintAlgo deint_algos[] = {
+    { "",                                    "",                                   "none (progressive or already deinterlaced)" },
+    { "bwdif=0",                             "bwdif=1",                            "bwdif - best all-round quality (automatic default: 1:2)" },
+    { "yadif=0",                             "yadif=1",                            "yadif - classic, slightly softer" },
+    { "w3fdif=filter=complex:mode=frame",    "w3fdif=filter=complex:mode=field",   "w3fdif (complex filter) - sharp, good on fine detail" },
+    { "estdif=mode=frame",                   "estdif=mode=field",                  "estdif (edge-slope tracing) - good on diagonal edges" },
+    { "separatefields,select='eq(mod(n,2),0)',scale=iw:2*ih:flags=bicubic",
+      "separatefields,scale=iw:2*ih:flags=bicubic",                                "bob (fields stretched vertically) - fastest, softest" },
+    { "fieldmatch,yadif=deint=interlaced,decimate",
+      "fieldmatch,yadif=deint=interlaced,decimate",                                "inverse telecine (24p film carried in 60i -> 23.976 fps), rate ignored" },
+};
+#define DEINT_ALGOS ((int)(sizeof(deint_algos) / sizeof(deint_algos[0])))
+
+static void deint_list(void)
+{
+    fprintf(stderr, "Deinterlacing: --deint ALGO:RATE\n"
+                    "  RATE 1 = one image per frame (same rate), RATE 2 = one image per field (double rate)\n"
+                    "  ALGO alone means ALGO:2\n\n");
+    for(int i = 0; i < DEINT_ALGOS; i++)
+        fprintf(stderr, "  %d   %s\n", i, deint_algos[i].info);
+    fprintf(stderr, "\n  examples: 1:2 (bwdif, double rate)   2:1 (yadif, same rate)   3:2 (w3fdif, double rate)\n"
+                    "  default (no --deint): automatic, 1:2 when the video is interlaced\n"
+                    "  anything else is used as an ffmpeg filter chain, e.g. \"yadif=mode=1:parity=tff,atadenoise\"\n");
+}
+
+// "N" ou "N:R" -> chaîne de filtres ; renvoie 0 si la forme n'est pas ALGO:CADENCE (chaîne libre),
+// 1 si trouvé (chain renseigné), -1 si le numéro ou la cadence sont invalides.
+static int deint_resolve(const char *arg, const char **chain)
+{
+    char *end = NULL;
+    long algo = strtol(arg, &end, 10);
+    if(end == arg) return 0;
+    long rate = 2;
+    if(*end == ':') {
+        char *end2 = NULL;
+        rate = strtol(end + 1, &end2, 10);
+        if(end2 == end + 1 || *end2 != '\0') return 0;
+    } else if(*end != '\0') return 0;
+    if(algo < 0 || algo >= DEINT_ALGOS || (rate != 1 && rate != 2)) return -1;
+    *chain = (rate == 1) ? deint_algos[algo].one : deint_algos[algo].two;
+    return 1;
+}
+
+// YUV 4:4:4 planaire -> RGB24 (matrice BT.601/709, plage limitée/pleine). Mêmes
+// coefficients et arrondis que le noyau OpenCL yuv2rgb_k.
+static void ts_yuv444_to_rgb(const unsigned char *Y, const unsigned char *U, const unsigned char *V,
+                             unsigned char *rgb, size_t n, int hd, int full)
+{
+    const int cy  = full ? 256 : 298;
+    const int crv = hd ? (full ? 403 : 459) : (full ? 359 : 409);
+    const int cgu = hd ? (full ?  48 :  55) : (full ?  88 : 100);
+    const int cgv = hd ? (full ? 120 : 136) : (full ? 183 : 208);
+    const int cbu = hd ? (full ? 475 : 541) : (full ? 454 : 516);
+    for(size_t i = 0; i < n; i++)
+    {
+        int y = Y[i] - (full ? 0 : 16), u = U[i] - 128, v = V[i] - 128;
+        int r = (cy * y + crv * v + 128) >> 8;
+        int g = (cy * y - cgu * u - cgv * v + 128) >> 8;
+        int b = (cy * y + cbu * u + 128) >> 8;
+        rgb[3*i]   = (unsigned char)(r < 0 ? 0 : r > 255 ? 255 : r);
+        rgb[3*i+1] = (unsigned char)(g < 0 ? 0 : g > 255 ? 255 : g);
+        rgb[3*i+2] = (unsigned char)(b < 0 ? 0 : b > 255 ? 255 : b);
+    }
+}
+
+// Les tables CPU (64 Mo chacune) ne sont pas construites quand OpenCL est actif.
+#define BUILD_K2D(...) do { if(!use_ocl) build_k2d(__VA_ARGS__); } while(0)
+
+// Lecture d'une image d'entrée (chemin CPU) : libav si --source, sinon le flux.
+#ifdef TS_FFMPEG
+#define READ_FRAME(buf) (av_src ? ts_av_read(av_src, (buf), NULL) : (fread((buf), in_buf_length, 1, input) == 1))
+#else
+#define READ_FRAME(buf) (fread((buf), in_buf_length, 1, input) == 1)
+#endif
 
 int main(int argc, char **argv)
 {
@@ -2811,7 +3222,27 @@ int main(int argc, char **argv)
 	int *tmp_weights = NULL;  // poids temporel par phase (taille = frames_ratio)
 	double aniso_strength = 1.0;  // défaut : anisotropie pleine
 	int blur_artifact = 0;
-	
+	int want_ocl = 0;        // --opencl demandé
+	int ocl_dev_idx = -1;    // --ocl-device (-1 = auto)
+	int use_ocl = 0;         // backend OpenCL effectivement actif
+	int want_display = 0;    // --display : fenêtre OpenGL au lieu de stdout
+	double disp_fps = 60.0;  // --display-fps : cadence d'affichage des frames de sortie
+	char *input_cmd = NULL;  // --input-cmd : commande (ffmpeg) dont stdout fournit la vidéo
+	char *audio_cmd = NULL;   // --audio-cmd : commande fournissant le PCM s16le 48 kHz stéréo
+	char *audio_file = NULL;  // --audio FILE : raccourci (ffmpeg décode le son de FILE)
+	double audio_offset = 0.0; // --audio-offset MS : décalage image/son
+	FILE *audio_stream = NULL; // flux PCM ouvert pour l'affichage
+	char *source_file = NULL;  // --source FILE : fichier lu et décodé par libav (sans pipe)
+	char *vf_chain = NULL;     // --vf : chaîne de filtres libavfilter (ex. bwdif=1)
+	int no_audio = 0;          // --no-audio : ne pas lire le son de --source
+	int no_deint = 0;          // --no-deint : pas de désentrelacement automatique
+	char *deint_arg = NULL;    // --deint : numéro de réglage ou chaîne ffmpeg libre (NULL = automatique)
+	const char *deint_chain = NULL;
+	int out_w_set = 0, out_h_set = 0, out_fmt_set = 0;   // options données par l'utilisateur
+	int final_rgb = 0;         // --source : sortie finale RGB (mise à l'échelle en 4:4:4, conversion sur le GPU)
+	int yuv_709 = 0, yuv_full = 0;
+	AvSrc *av_src = NULL;
+
 	PixFmt in_pix_fmt  = PIX_RGB;
 	PixFmt out_pix_fmt = PIX_RGB;
 	
@@ -2884,6 +3315,21 @@ int main(int argc, char **argv)
 		{"out-pix-fmt", 1, 0, 12},
 		{"aniso-strength", 1, 0, 13},
 		{"blur-artifact", 0, 0, 14},
+		{"opencl", 0, 0, 15},
+		{"ocl-device", 1, 0, 16},
+		{"ocl-list", 0, 0, 17},
+		{"display", 0, 0, 18},
+		{"display-fps", 1, 0, 19},
+		{"input-cmd", 1, 0, 20},
+		{"audio-cmd", 1, 0, 21},
+		{"audio", 1, 0, 22},
+		{"audio-offset", 1, 0, 23},
+		{"source", 1, 0, 24},
+		{"vf", 1, 0, 25},
+		{"no-audio", 0, 0, 26},
+		{"no-deint", 0, 0, 27},
+		{"deint", 1, 0, 28},
+		{"deint-list", 0, 0, 29},
 		{0, 0, 0, 0}//reminder : letter value are from 65 to 122
 	};
 
@@ -2899,10 +3345,10 @@ int main(int argc, char **argv)
 			in_h = atoi(optarg);
 			break;
 		case 3:
-			out_w = atoi(optarg);
+			out_w = atoi(optarg); out_w_set = 1;
 			break;
 		case 4:
-			out_h = atoi(optarg);
+			out_h = atoi(optarg); out_h_set = 1;
 			break;
 		case 5:
 			frames_ratio = atoi(optarg);
@@ -2936,6 +3382,7 @@ int main(int argc, char **argv)
 			else { fprintf(stderr, "Error: unknown in-pix-fmt '%s'\n", optarg); return -1; }
 			break;
 		case 12:
+			out_fmt_set = 1;
 			if     (strcmp(optarg, "rgb24") == 0 || strcmp(optarg, "RGB24") == 0 || strcmp(optarg, "rgb") == 0 || strcmp(optarg, "RGB") == 0) out_pix_fmt = PIX_RGB;
 			else if(strcmp(optarg, "444p") == 0 || strcmp(optarg, "444P") == 0 || strcmp(optarg, "444") == 0) out_pix_fmt = PIX_444P;
 			else if(strcmp(optarg, "422p") == 0 || strcmp(optarg, "422P") == 0 || strcmp(optarg, "422") == 0) out_pix_fmt = PIX_422P;
@@ -2954,15 +3401,61 @@ int main(int argc, char **argv)
 		case 14:
 			blur_artifact = 1;
 			break;
+		case 15:
+			want_ocl = 1;
+			break;
+		case 16:
+			want_ocl = 1;
+			ocl_dev_idx = atoi(optarg);
+			break;
+		case 18:
+			want_display = 1;
+			break;
+		case 19:
+			disp_fps = atof(optarg);
+			break;
+		case 21:
+			audio_cmd = optarg;
+			break;
+		case 22:
+			audio_file = optarg;
+			break;
+		case 24:
+			source_file = optarg;
+			break;
+		case 25:
+			vf_chain = optarg;
+			break;
+		case 28:
+			deint_arg = optarg;
+			break;
+		case 29:
+			deint_list();
+			return 0;
+		case 27:
+			no_deint = 1;
+			break;
+		case 26:
+			no_audio = 1;
+			break;
+		case 23:
+			audio_offset = atof(optarg);
+			break;
+		case 20:
+			input_cmd = optarg;
+			break;
+		case 17:
+			ocl_list_devices();
+			return 0;
 		default:
 			usage();
 			break;
 		}
 	}
 	
-	if(input_name == NULL)
+	if(input_name == NULL && input_cmd == NULL && source_file == NULL)
 	{
-		fprintf(stderr, "no input file provided\n");
+		fprintf(stderr, "no input provided (use --source FILE, -i FILE or --input-cmd COMMAND)\n");
 		return -1;
 	}
 	
@@ -3001,7 +3494,57 @@ int main(int argc, char **argv)
 	}
 	
 	//reading file
-	if (strcmp(input_name, "-") == 0)// Read samples from stdin
+	if (source_file)   // lecture directe par libav : pas de pipe, pas de processus externe
+	{
+#ifdef TS_FFMPEG
+		// --deint : "ALGO:CADENCE" (ex. 1:2), "auto", ou chaîne ffmpeg libre (NULL = automatique)
+		if (deint_arg && strcmp(deint_arg, "auto") != 0)
+		{
+			int r = deint_resolve(deint_arg, &deint_chain);
+			if (r < 0)
+			{
+				fprintf(stderr, "Error: invalid --deint \"%s\" (ALGO 0..%d, RATE 1 or 2), see --deint-list\n", deint_arg, DEINT_ALGOS - 1);
+				return -1;
+			}
+			if (r == 0) deint_chain = deint_arg;    // chaîne libre
+		}
+		if (no_deint) deint_chain = "";
+		av_src = ts_av_open(source_file, vf_chain, deint_chain, want_display && !no_audio, !no_deint);
+		if (!av_src) return -1;
+		in_w = av_src->w;
+		in_h = av_src->h;
+
+		// Le scaler travaille en YUV 4:2:0 -> 4:4:4 (chroma suréchantillonnée par nos noyaux,
+		// pas par swscale). Une sortie RGB est obtenue en convertissant le 4:4:4 sur le GPU.
+		in_pix_fmt = PIX_420P;
+		final_rgb  = !out_fmt_set || out_pix_fmt == PIX_RGB || out_pix_fmt == PIX_RGB48;
+		if (final_rgb) out_pix_fmt = PIX_444P;
+		yuv_709  = av_src->color_709;
+		yuv_full = av_src->color_full;
+
+		// Taille de sortie : on ne demande qu'une dimension, l'autre suit le DAR de la source.
+		if (out_h_set && !out_w_set)       out_w = ((int)(out_h * av_src->dar + 0.5) + 1) & ~1;
+		else if (out_w_set && !out_h_set)  out_h = ((int)(out_w / av_src->dar + 0.5) + 1) & ~1;
+		fprintf(stderr, "Source: %dx%d (DAR %.4f), %s%s%s%s -> %dx%d\n", in_w, in_h, av_src->dar,
+			av_src->interlaced ? "interlaced" : "progressive",
+			av_src->vf_used[0] ? " [" : "", av_src->vf_used, av_src->vf_used[0] ? "]" : "",
+			out_w, out_h);
+		fprintf(stderr, "Source: %s\n", av_src->has_audio ? "with audio" : "no audio");
+#else
+		fprintf(stderr, "Error: --source needs a build with ffmpeg (-DTS_FFMPEG, see compilation.bat)\n");
+		return -1;
+#endif
+	}
+	else
+	if (input_cmd)   // la sortie standard de la commande (ffmpeg) est la vidéo brute
+	{
+		input = POPEN(input_cmd, "rb");
+		if (!input) {
+			fprintf(stderr, "Failed to run: %s\n", input_cmd);
+			return -1;
+		}
+	}
+	else if (strcmp(input_name, "-") == 0)// Read samples from stdin
 	{
 		input = stdin;
 	}
@@ -3092,7 +3635,48 @@ int main(int argc, char **argv)
 	
 	const int bps_in  = (in_pix_fmt  >= PIX_RGB48) ? 2 : 1;
 	const int bps_out = (out_pix_fmt >= PIX_RGB48) ? 2 : 1;
-	
+
+	if(want_ocl)
+	{
+		if(mode_1d)
+			fprintf(stderr, "OpenCL: the --1d pipeline is not supported, using the CPU\n");
+		else if(ocl_init(ocl_dev_idx) == 0)
+			use_ocl = 1;
+		else
+		{
+			ocl_release();
+			fprintf(stderr, "OpenCL unavailable, using the CPU\n");
+		}
+	}
+
+	if(want_display)
+	{
+#ifndef _WIN32
+		fprintf(stderr, "Error: --display is only available on Windows\n"); return -1;
+#endif
+		if(!use_ocl) { fprintf(stderr, "Error: --display requires a working --opencl\n"); return -1; }
+		if(!(final_rgb || out_pix_fmt == PIX_RGB || out_pix_fmt == PIX_RGB48)) { fprintf(stderr, "Error: --display requires an RGB output (--out-pix-fmt RGB or RGB48)\n"); return -1; }
+
+		// audio : flux PCM s16le 48 kHz stéréo (ffmpeg lancé par le programme)
+		char audio_buf[1024];
+		if(audio_file && !audio_cmd)
+		{
+			snprintf(audio_buf, sizeof(audio_buf),
+				"ffmpeg -v error -i \"%s\" -vn -f s16le -ar 48000 -ac 2 -", audio_file);
+			audio_cmd = audio_buf;
+		}
+		if(audio_cmd)
+		{
+			audio_stream = POPEN(audio_cmd, "rb");
+			if(!audio_stream) fprintf(stderr, "Warning: cannot start the audio command, playing without sound\n");
+		}
+	}
+	else if(audio_cmd || audio_file)
+	{
+		fprintf(stderr, "Error: --audio / --audio-cmd require --display\n");
+		return -1;
+	}
+
 	if(out_h > in_h && out_w > in_w && in_h > 0 && in_w > 0)
 	{
 		switch(in_pix_fmt) {
@@ -3244,6 +3828,8 @@ int main(int argc, char **argv)
 	}
 	
 	//compute the maping used for scaling the input image into an output one
+	memset(map.w_weight, 0, map.w_length * sizeof(int)); memset(map.w_heavy, 0, map.w_length * sizeof(int));
+	memset(map.h_weight, 0, map.h_length * sizeof(int)); memset(map.h_heavy, 0, map.h_length * sizeof(int));
 	compute_scale_map(&map, in_w, in_h, out_w, out_h, frames_ratio);
 	
 	//anchor_cardinal_positions(&map, in_w, in_h, out_w, out_h, frames_ratio);
@@ -3276,18 +3862,18 @@ int main(int argc, char **argv)
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_LINEAR, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_curve_rad_lut(3, curve_base);
-		build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
+		BUILD_K2D(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
 		if(need_map_uv)
-			build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
+			BUILD_K2D(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
 		}
 	else if(mode == 4)
 	{
 		compute_curve_weights(&map, out_w, out_h, frames_ratio, CURVE_EXPONENTIAL, curve_base);
 		adjust_phase_direction_weighted(&map, in_w, in_h, out_w, out_h, frames_ratio);
 		compute_curve_rad_lut(4, curve_base);
-		build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
+		BUILD_K2D(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
 		if(need_map_uv)
-			build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
+			BUILD_K2D(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
 		}
 	else if(mode == 2)
 	{
@@ -3310,31 +3896,33 @@ int main(int argc, char **argv)
 		compute_kaiser4_lut(kaiser_beta);
 		compute_kaiser_rad_lut_into(kaiser_rad_lut, kaiser_beta, curve_base);
 		compute_kaiser_rad_lut_into(kaiser_rad_lut_soft, kaiser_beta, pow(curve_base, 1.0/3.0));
-		build_k2d(kaiser_k2d,      kaiser_rad_lut,      KAISER_RAD_SIZE, in_w);
-		build_k2d(kaiser_k2d_soft, kaiser_rad_lut_soft, KAISER_RAD_SIZE, in_w);
+		BUILD_K2D(kaiser_k2d,      kaiser_rad_lut,      KAISER_RAD_SIZE, in_w);
+		BUILD_K2D(kaiser_k2d_soft, kaiser_rad_lut_soft, KAISER_RAD_SIZE, in_w);
 		compute_curve_rad_lut(4, curve_base);
-		build_k2d(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
+		BUILD_K2D(curve_k2d, curve_rad_lut, CURVE_RAD_SIZE, in_w);
 		if(need_map_uv)
 		{
-			build_k2d(kaiser_k2d_uv,      kaiser_rad_lut,      KAISER_RAD_SIZE, uv_in_w);
-			build_k2d(kaiser_k2d_soft_uv, kaiser_rad_lut_soft, KAISER_RAD_SIZE, uv_in_w);
-			build_k2d(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
+			BUILD_K2D(kaiser_k2d_uv,      kaiser_rad_lut,      KAISER_RAD_SIZE, uv_in_w);
+			BUILD_K2D(kaiser_k2d_soft_uv, kaiser_rad_lut_soft, KAISER_RAD_SIZE, uv_in_w);
+			BUILD_K2D(curve_k2d_uv, curve_rad_lut, CURVE_RAD_SIZE, uv_in_w);
 		}
 	 
 		if(mode == 7) {
 			// table douce : courbe exponentielle radius=1 (mode 4 style),
 			// cardinale, sans lobes → utilisée quand conf==0
 			compute_mid_rad_lut(kaiser_beta);
-			build_k2d(mid_k2d, mid_rad_lut, MID_RAD_SIZE, in_w);
+			BUILD_K2D(mid_k2d, mid_rad_lut, MID_RAD_SIZE, in_w);
 			if(need_map_uv)
 			{
-				build_k2d(mid_k2d_uv, mid_rad_lut, MID_RAD_SIZE, uv_in_w);
+				BUILD_K2D(mid_k2d_uv, mid_rad_lut, MID_RAD_SIZE, uv_in_w);
 			}
 		}
 	}
 	
 	if(need_map_uv)
 	{
+		memset(map_uv.w_weight, 0, map_uv.w_length * sizeof(int)); memset(map_uv.w_heavy, 0, map_uv.w_length * sizeof(int));
+		memset(map_uv.h_weight, 0, map_uv.h_length * sizeof(int)); memset(map_uv.h_heavy, 0, map_uv.h_length * sizeof(int));
 		compute_scale_map(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
 		
 		//anchor_cardinal_positions(&map_uv, uv_in_w, uv_in_h, uv_out_w, uv_out_h, frames_ratio);
@@ -3352,10 +3940,80 @@ int main(int argc, char **argv)
 
 	// Pré-calcul des poids temporels (une fois pour toute la vidéo)
 	compute_temporal_weights(tmp_weights, frames_ratio, (TmpMode)tmp_mode, curve_base);
-	
+
+	// --- OpenCL : géométrie des plans, LUT radiales, envoi cartes + tables ---
+	if(use_ocl)
+	{
+		OclSetup os;
+		memset(&os, 0, sizeof(os));
+		os.mode        = mode;
+		os.ratio       = frames_ratio;
+		os.bps_in      = bps_in;
+		os.bps_out     = bps_out;
+		os.aniso_fp    = (int)(aniso_strength * WEIGHT_MAX + 0.5);
+		os.in_len      = in_buf_length;
+		os.out_len     = out_buf_length;
+		os.rgb_out     = final_rgb;
+		os.yuv_709     = yuv_709;
+		os.yuv_full    = yuv_full;
+		os.maps[0]     = &map;
+		os.maps[1]     = need_map_uv ? &map_uv : &map;
+		os.tmp_weights = tmp_weights;
+		os.lut_size    = KAISER_RAD_SIZE;   // = CURVE_RAD_SIZE = MID_RAD_SIZE
+
+		if(mode == 3 || mode == 4)  os.lutA = curve_rad_lut;
+		else if(mode == 5)          os.lutA = kaiser_rad_lut_soft;
+		else if(mode >= 6)
+		{
+			os.lutA      = kaiser_rad_lut;
+			os.krad      = kaiser_rad_lut;
+			os.krad_size = KAISER_RAD_SIZE;
+			if(mode == 7) { os.lutB = curve_rad_lut; os.lutC = mid_rad_lut; }
+		}
+
+		if(is_rgb_in)
+		{
+			os.nplanes = 1;
+			os.planes[0].in_w = in_w;   os.planes[0].in_h = in_h;
+			os.planes[0].out_w = out_w; os.planes[0].out_h = out_h;
+			os.planes[0].chan = 3;      os.planes[0].map_idx = 0;
+			os.planes[0].in_off = 0;    os.planes[0].out_off = 0;
+			os.planes[0].out_step = (size_t)out_w * out_h * 3 * bps_out;
+		}
+		else
+		{
+			const size_t in_y_sz   = (size_t)in_w * in_h * bps_in;
+			const size_t in_uv_sz  = (size_t)uv_in_w * uv_in_h * bps_in;
+			const size_t out_y_sz  = (size_t)out_w * out_h * frames_ratio * bps_out;
+			const size_t out_uv_sz = (size_t)uv_out_w * uv_out_h * frames_ratio * bps_out;
+			os.nplanes = 3;
+			for(int p = 0; p < 3; p++)
+			{
+				OclPlane *pl = &os.planes[p];
+				pl->chan    = 1;
+				pl->map_idx = (p == 0) ? 0 : 1;
+				pl->in_w  = (p == 0) ? in_w  : uv_in_w;
+				pl->in_h  = (p == 0) ? in_h  : uv_in_h;
+				pl->out_w = (p == 0) ? out_w : uv_out_w;
+				pl->out_h = (p == 0) ? out_h : uv_out_h;
+				pl->in_off  = (p == 0) ? 0 : (p == 1) ? in_y_sz  : in_y_sz  + in_uv_sz;
+				pl->out_off = (p == 0) ? 0 : (p == 1) ? out_y_sz : out_y_sz + out_uv_sz;
+				pl->out_step = (size_t)pl->out_w * pl->out_h * bps_out;
+			}
+		}
+
+		if(ocl_setup(&os) != 0)
+		{
+			ocl_release();
+			fprintf(stderr, "OpenCL: setup failed (not enough device memory?)\n");
+			return -1;
+		}
+	}
+
 	ThreadArgs args[NB_THREADS];
 	for(int t=0; t<NB_THREADS; t++)
 	{
+		args[t].gpu_done    = 0;
 		args[t].map         = &map;
 		args[t].tmp_weights = tmp_weights;
 		args[t].in_w        = in_w;
@@ -3388,7 +4046,28 @@ int main(int argc, char **argv)
 	}
 
 	// Pré-lecture de la frame 0 dans in_buf[0]. Si vide, on saute la boucle.
-	int has_current = (fread(in_buf[0], in_buf_length, 1, input) == 1);
+	if(use_ocl)
+	{
+		// Pipeline continu lecture -> GPU -> écriture (voir gpu_stream_run).
+		GpuStream gs;
+		memset(&gs, 0, sizeof(gs));
+		gs.input = input;
+		gs.in_buf = in_buf; gs.out_buf = out_buf;
+		gs.in_len = in_buf_length; gs.out_len = out_buf_length;
+		gs.in_w = in_w; gs.in_h = in_h; gs.out_w = out_w; gs.out_h = out_h;
+		gs.bps_in = bps_in; gs.bps_out = bps_out; gs.ratio = frames_ratio;
+		gs.in_fmt = in_pix_fmt; gs.out_fmt = final_rgb ? PIX_RGB : out_pix_fmt;
+		gs.blur = blur_artifact; gs.map = &map;
+		gs.display = want_display; gs.disp_fps = disp_fps;
+		gs.audio = audio_stream; gs.audio_offset = audio_offset;
+#ifdef TS_FFMPEG
+		gs.av = av_src;
+		if(av_src && want_display) ts_av_clock_fn = disp_media_clock;
+#endif
+		gpu_stream_run(&gs);
+	}
+
+	int has_current = use_ocl ? 0 : READ_FRAME(in_buf[0]);
 
 	while (has_current)
 	{
@@ -3398,7 +4077,7 @@ int main(int argc, char **argv)
 		// recyclé comme "current" du worker 0 du batch suivant.
 		int frames_loaded = 1;  // in_buf[0] déjà chargé
 		for (int t = 1; t <= NB_THREADS; t++) {
-			if (fread(in_buf[t], in_buf_length, 1, input) == 1)
+			if (READ_FRAME(in_buf[t]))
 				frames_loaded++;
 			else
 				break;
@@ -3426,8 +4105,10 @@ int main(int argc, char **argv)
 				workers[t].args.next_buf = in_buf[t];  // dernière frame du fichier
 		}
 
+		const int dispatch_workers = 1;
+
 		// signal aux workers
-		for (int t = 0; t < frames_to_process; t++) {
+		for (int t = 0; dispatch_workers && t < frames_to_process; t++) {
 			pthread_mutex_lock(&workers[t].mutex);
 			workers[t].done  = 0;
 			workers[t].ready = 1;
@@ -3436,7 +4117,7 @@ int main(int argc, char **argv)
 		}
 
 		// attente
-		for (int t = 0; t < frames_to_process; t++) {
+		for (int t = 0; dispatch_workers && t < frames_to_process; t++) {
 			pthread_mutex_lock(&workers[t].mutex);
 			while (!workers[t].done)
 				pthread_cond_wait(&workers[t].cond_done, &workers[t].mutex);
@@ -3447,7 +4128,22 @@ int main(int argc, char **argv)
 		if (!isatty(STDOUT_FILENO)) {
 			for (int t = 0; t < frames_to_process; t++)
 			{
-				if(out_pix_fmt == PIX_RGB || out_pix_fmt == PIX_RGB48)
+				if(final_rgb)
+				{
+					// sortie 4:4:4 -> RGB24 sur le CPU (même arithmétique que le noyau GPU)
+					const size_t plane = (size_t)out_w * out_h;
+					unsigned char *rgb = (unsigned char *)malloc(plane * 3);
+					for(int f = 0; f < frames_ratio && rgb; f++)
+					{
+						ts_yuv444_to_rgb(out_buf[t] + f * plane,
+						                 out_buf[t] + plane * frames_ratio + f * plane,
+						                 out_buf[t] + plane * frames_ratio * 2 + f * plane,
+						                 rgb, plane, yuv_709, yuv_full);
+						fwrite(rgb, plane * 3, 1, stdout);
+					}
+					free(rgb);
+				}
+				else if(out_pix_fmt == PIX_RGB || out_pix_fmt == PIX_RGB48)
 				{
 					fwrite(out_buf[t], out_buf_length, 1, stdout);
 				}
@@ -3537,9 +4233,15 @@ int main(int argc, char **argv)
 		ALIGNED_FREE(dist_buf[t]);
 	}
 	ALIGNED_FREE(in_buf[NB_THREADS]);
-	
+
+	if(use_ocl) ocl_release();
+
 	//Close file
-	if (input && (input != stdin))
+	if (input && input_cmd)
+	{
+		PCLOSE(input);
+	}
+	else if (input && (input != stdin))
 	{
 		fclose(input);
 	}
