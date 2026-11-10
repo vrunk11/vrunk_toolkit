@@ -252,6 +252,13 @@ static int curve_rad_lut[CURVE_RAD_SIZE];
 
 #define NQUANT (WEIGHT_MAX << NQUANT_SHIFT)
 
+// Nombre de noyaux des tables CPU (64 Mo chacune). Le plugin VLC n'utilise que le GPU : 1 suffit.
+#ifdef TS_PLUGIN
+#define K2D_ENTRIES 1
+#else
+#define K2D_ENTRIES (NQUANT * NQUANT)
+#endif
+
 #define FQ(frac) ((frac) << NQUANT_SHIFT)
 
 #define NQUANT_ANGLE 64       // orientations quantifiées sur [0, pi)
@@ -279,22 +286,22 @@ typedef struct {
     int8_t  pad[7];
 } __attribute__((aligned(64))) Kernel2D;
  
-static Kernel2D kaiser_k2d   [NQUANT * NQUANT];
-static Kernel2D kaiser_k2d_uv[NQUANT * NQUANT];
-static Kernel2D curve_k2d    [NQUANT * NQUANT];
-static Kernel2D curve_k2d_uv [NQUANT * NQUANT];
+static Kernel2D kaiser_k2d   [K2D_ENTRIES];
+static Kernel2D kaiser_k2d_uv[K2D_ENTRIES];
+static Kernel2D curve_k2d    [K2D_ENTRIES];
+static Kernel2D curve_k2d_uv [K2D_ENTRIES];
 
 static int kaiser_rad_lut_soft[KAISER_RAD_SIZE];
-static Kernel2D kaiser_k2d_soft   [NQUANT * NQUANT];
-static Kernel2D kaiser_k2d_soft_uv[NQUANT * NQUANT];
+static Kernel2D kaiser_k2d_soft   [K2D_ENTRIES];
+static Kernel2D kaiser_k2d_soft_uv[K2D_ENTRIES];
 
 #define MID_RAD_SIZE  CURVE_RAD_SIZE          // même taille d'index que les autres
 #define MID_LOBE_GAIN 0.5                       // atténuation des lobes négatifs
  
 static int mid_rad_lut[MID_RAD_SIZE];
  
-static Kernel2D mid_k2d   [NQUANT * NQUANT];
-static Kernel2D mid_k2d_uv[NQUANT * NQUANT];
+static Kernel2D mid_k2d   [K2D_ENTRIES];
+static Kernel2D mid_k2d_uv[K2D_ENTRIES];
  
 void compute_mid_rad_lut(double beta)
 {
