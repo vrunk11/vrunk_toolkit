@@ -44,16 +44,23 @@
 static int  Open (vlc_object_t *);
 static void Close(vlc_object_t *);
 
-#define HEIGHT_TEXT     N_("Output height")
-#define HEIGHT_LONGTEXT N_("Vertical resolution the picture is scaled to on the GPU " \
-    "(the width follows the display aspect ratio). 0 = height of the screen. " \
-    "The scaler only enlarges: it must be larger than the video.")
+#define HEIGHT_TEXT     N_("Output height (-1 = automatic)")
+#define HEIGHT_LONGTEXT N_("Vertical resolution the picture is scaled to on the GPU (the width follows the " \
+    "display aspect ratio). -1 = automatic: follows the size of the picture shown in the window (and VLC " \
+    "zoom, crop and aspect ratio); the scaler is rebuilt about half a second after a resize. " \
+    "0 = height of the screen. Any other value = fixed. The scaler only enlarges: the output is " \
+    "always larger than the video.")
 #define MODE_TEXT       N_("Scaling algorithm")
 #define MODE_LONGTEXT   N_("0 nearest, 1 bilinear on duplicated pixels, 2 bilinear with temporal " \
     "alternation, 3 linear weighted 2D, 4 exponential weighted 2D, 5 Kaiser 6x6 EWA, " \
     "6 Kaiser anisotropic edge-directed, 7 Kaiser anisotropic + selective softening.")
-#define RATIO_TEXT      N_("Frame rate multiplier")
-#define RATIO_LONGTEXT  N_("Number of output pictures shown per decoded picture (2 = 30 fps shown at 60 fps).")
+#define RATIO_TEXT      N_("Frame rate multiplier (0 = automatic)")
+#define RATIO_LONGTEXT  N_("Number of output pictures shown per decoded picture (2 = 30 fps shown at 60 fps). " \
+    "0 = automatic: the display rate (see 'Target display rate') is reached exactly by alternating " \
+    "between two multipliers (pulldown: 24 fps on 60 Hz = 2,3,2,3...).")
+#define FPS_TEXT        N_("Target display rate in Hz (0 = screen refresh rate)")
+#define FPS_LONGTEXT    N_("Used when the frame rate multiplier is 0. 0 = refresh rate of the screen the window " \
+    "is on (follows the window or full screen to another screen); or force e.g. 59.94.")
 #define TMP_TEXT        N_("Temporal blending mode")
 #define TMP_LONGTEXT    N_("0 duplicate pictures, 1 blend 50% on the upper phases, 2 linear, " \
     "3 exponential. Anything but 0 delays the picture by one frame.")
@@ -73,9 +80,10 @@ vlc_module_begin()
     set_subcategory(SUBCAT_VIDEO_VOUT)
     set_capability("vout display", 0)
     add_shortcut("tscale")
-    add_integer("tscale-height", 2160, HEIGHT_TEXT, HEIGHT_LONGTEXT, false)
+    add_integer("tscale-height", -1, HEIGHT_TEXT, HEIGHT_LONGTEXT, false)
     add_integer_with_range("tscale-mode", 5, 0, 7, MODE_TEXT, MODE_LONGTEXT, false)
-    add_integer_with_range("tscale-ratio", 1, 1, 8, RATIO_TEXT, RATIO_LONGTEXT, false)
+    add_integer_with_range("tscale-ratio", 0, 0, 8, RATIO_TEXT, RATIO_LONGTEXT, false)
+    add_float("tscale-fps", 0.0, FPS_TEXT, FPS_LONGTEXT, false)
     add_integer_with_range("tscale-tmp-mode", 0, 0, 3, TMP_TEXT, TMP_LONGTEXT, true)
     add_float("tscale-curve", 2.0, CURVE_TEXT, CURVE_LONGTEXT, true)
     add_float("tscale-beta", 2.5, BETA_TEXT, BETA_LONGTEXT, true)
@@ -90,14 +98,30 @@ struct vout_display_sys_t {
     TsCtx          *ts;
     TsParams        params;         /* paramètres du moteur (ouvert à la première image) */
     int             ts_failed;
-    int             ratio;
+    int             ratio;          /* multiplicateur en cours */
+    int             opt_ratio;      /* option tscale-ratio : 0 = automatique */
+    int             refresh_hz;     /* fréquence de l'écran de la fenêtre (mise en cache) */
+    mtime_t         refresh_t;
     int             swap_uv;        /* YV12 : plans U et V inversés */
     int             x_off, y_off;   /* recadrage éventuel de la source */
-    int             out_w, out_h;
+    int             out_w, out_h;   /* taille de sortie actuelle du scaler */
+    double          dar;
+    int             opt_height;     /* option tscale-height : -1 auto, 0 écran, >0 fixe */
+    int             zoom_num, zoom_den;
+    int             tex_w, tex_h, max_tex;
+    /* demande de changement de géométrie en attente (temporisée) */
+    int             pending, pend_h, pend_x, pend_y, pend_w, pend_hh, pend_ratio;
+    double          pend_dar;
+    mtime_t         pend_since;
     /* anneau d'images prêtes (ratio images RGB24 chacune) : le thread vidéo de VLC écrit,
      * le thread de rendu présente */
 #define NSLOT 3
-    struct { uint8_t *data; mtime_t date; int n; } slot[NSLOT];
+    /* n images affichées parmi les R produites (pulldown), l'une après l'autre toutes les `step` */
+    struct { uint8_t *data; mtime_t date; mtime_t step; int n, R; int w, h; } slot[NSLOT];
+    int             n_cur;          /* images à afficher pour l'image en cours (pulldown) */
+    double          acc;            /* accumulateur du pulldown */
+    double          opt_fps;        /* option tscale-fps : 0 = fréquence de l'écran */
+    double          target_fps;     /* cadence d'affichage visée */
     int             wr, rd, count, stop;
     CRITICAL_SECTION   cs;
     CONDITION_VARIABLE cv;
@@ -123,6 +147,7 @@ struct vout_display_sys_t {
 
     mtime_t         last_date;      /* pour estimer la durée d'une image */
     mtime_t         period;
+    int             period_set, period_chg;
 };
 
 
@@ -314,20 +339,36 @@ static int GlOpen(vout_display_t *vd, vout_display_sys_t *sys)
     return 0;
 }
 
-static void GlPresent(vout_display_sys_t *sys, const uint8_t *rgb)
+/* Texture : (ré)allouée par le thread de rendu quand la taille de sortie change. */
+static void GlEnsureTexture(vout_display_sys_t *sys, int w, int h)
+{
+    if (sys->tex_w == w && sys->tex_h == h) return;
+    glBindTexture(GL_TEXTURE_2D, sys->tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    sys->tex_w = w;
+    sys->tex_h = h;
+}
+
+static void GlPresent(vout_display_sys_t *sys, const uint8_t *rgb, int w, int h)
 {
     RECT rc;
     GetClientRect(sys->hwnd, &rc);
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
     if (cw < 1 || ch < 1) return;
 
+    GlEnsureTexture(sys, w, h);
     glBindTexture(GL_TEXTURE_2D, sys->tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sys->out_w, sys->out_h, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, rgb);
 
-    /* rapport d'aspect conservé (bandes noires) */
-    double sa = (double)sys->out_w / sys->out_h, wa = (double)cw / ch;
-    int vw = cw, vh = ch;
-    if (wa > sa) vw = (int)(ch * sa + 0.5); else vh = (int)(cw / sa + 0.5);
+    /* rapport d'aspect conservé (bandes noires), zoom de VLC appliqué */
+    double sa = (double)w / h, wa = (double)cw / ch;
+    double fw = cw, fh = ch;
+    if (wa > sa) fw = ch * sa; else fh = cw / sa;
+    if (sys->zoom_den > 0 && sys->zoom_num > 0) {
+        fw = fw * sys->zoom_num / sys->zoom_den;
+        fh = fh * sys->zoom_num / sys->zoom_den;
+    }
+    int vw = (int)(fw + 0.5), vh = (int)(fh + 0.5);
     glViewport(0, 0, cw, ch);
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -371,7 +412,7 @@ static int RenderInitGl(vout_display_sys_t *sys)
 
     GLint maxtex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
-    if (maxtex > 0 && (sys->out_w > maxtex || sys->out_h > maxtex)) return -2;
+    sys->max_tex = maxtex > 0 ? maxtex : 8192;
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glGenTextures(1, &sys->tex);
     glBindTexture(GL_TEXTURE_2D, sys->tex);
@@ -379,7 +420,6 @@ static int RenderInitGl(vout_display_sys_t *sys)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, sys->out_w, sys->out_h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
     return glGetError() == GL_NO_ERROR ? 0 : -3;
 }
 
@@ -397,17 +437,22 @@ static DWORD WINAPI RenderThread(LPVOID arg)
         if (sys->stop) { LeaveCriticalSection(&sys->cs); break; }
         const int i = sys->rd;
         const mtime_t date = sys->slot[i].date;
-        const int n = sys->slot[i].n;
+        const int n = sys->slot[i].n, R = sys->slot[i].R;
+        const mtime_t step = sys->slot[i].step;
+        const int w = sys->slot[i].w, h = sys->slot[i].h;
         const mtime_t period = sys->period;
         /* rattrapage : image en retard alors qu'une plus récente attend déjà -> on la saute */
         const int skip = (sys->count > 1 && date > 0 && mdate() > date + period);
         LeaveCriticalSection(&sys->cs);
 
         if (!skip && n > 0) {
+            const size_t fb = (size_t)w * h * 3;
             for (int k = 0; k < n; k++) {
                 if (k > 0)   /* 6 ms d'avance : l'échange se cale ensuite sur la synchro verticale */
-                    mwait(date + (mtime_t)((int64_t)period * k / n) - 6000);
-                GlPresent(sys, sys->slot[i].data + (size_t)k * sys->frame_bytes);
+                    mwait(date + step * k - 6000);
+                /* n phases régulièrement réparties parmi les R calculées */
+                const int idx = (int)((int64_t)k * R / n);
+                GlPresent(sys, sys->slot[i].data + (size_t)idx * fb, w, h);
             }
         }
 
@@ -423,35 +468,240 @@ static DWORD WINAPI RenderThread(LPVOID arg)
     return 0;
 }
 
+/* ---- géométrie : zone source (recadrage), aspect, taille de sortie ---- */
+
+typedef struct {
+    int    x, y, in_w, in_h;    /* zone source utilisée (recadrage de VLC appliqué) */
+    int    out_w, out_h;
+    double dar;
+    int    ratio;               /* images calculées par image reçue (R) */
+    double mult;                /* images affichées par image reçue, en moyenne (<= R) */
+    double target;              /* cadence d'affichage visée (Hz) */
+} Geom;
+
+/* Fréquence de l'écran sur lequel se trouve la fenêtre (Hz), relue toutes les 500 ms : suit le
+ * déplacement vers un autre écran et le plein écran. */
+static int ScreenRefreshHz(vout_display_sys_t *sys)
+{
+    const mtime_t now = mdate();
+    if (sys->refresh_hz > 0 && now - sys->refresh_t < 500000) return sys->refresh_hz;
+    sys->refresh_t = now;
+    int hz = 0;
+    MONITORINFOEXA mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (sys->hwnd && GetMonitorInfoA(MonitorFromWindow(sys->hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi)) {
+        DEVMODEA dm;
+        memset(&dm, 0, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            hz = (int)dm.dmDisplayFrequency;
+    }
+    if (hz <= 1) hz = 60;
+    sys->refresh_hz = hz;
+    return hz;
+}
+
+/* Multiplicateur moyen voulu m = cadence d'affichage visée / cadence reçue (1..8). Le moteur calcule
+ * R = ceil(m) phases par image (le jeu de cartes « au-dessus ») ; quand m n'est pas entier on n'en
+ * affiche que n = floor(m) ou floor(m)+1 selon un accumulateur (pulldown, ex. 24 -> 60 : 2,3,2,3),
+ * en choisissant des phases régulièrement réparties (le jeu « en dessous »). Si m est à 0,03 d'un
+ * entier (29,97 -> 60 Hz) il est ramené à cet entier : pas de pulldown. */
+static void AutoMult(vout_display_sys_t *sys, int *R, double *m, double *target)
+{
+    const double fps = sys->period > 0 ? (double)CLOCK_FREQ / sys->period : 25.0;
+    const double tgt = sys->opt_fps > 0 ? sys->opt_fps : (double)ScreenRefreshHz(sys);
+    double mm = tgt / fps;
+    if (mm < 1.0) mm = 1.0;
+    if (mm > 8.0) mm = 8.0;
+    const double r = floor(mm + 0.5);
+    if (fabs(mm - r) < 0.03) { mm = r; *R = (int)r; }
+    else                     { *R = (int)ceil(mm); }
+    *m = mm;
+    *target = tgt;
+}
+
+/* Calcule la géométrie voulue maintenant : recadrage et aspect de VLC (vd->source), taille de la
+ * fenêtre, zoom. Hauteur de sortie : option tscale-height (-1 = suit l'image affichée dans la fenêtre,
+ * 0 = hauteur de l'écran, >0 = fixe). Le scaler ne sait qu'agrandir : la sortie reste plus grande
+ * que la source dans les deux dimensions. */
+static void ComputeGeom(vout_display_t *vd, vout_display_sys_t *sys, Geom *g)
+{
+    const video_format_t *s = &vd->source;
+    int x = s->i_x_offset, y = s->i_y_offset;
+    int w = s->i_visible_width, h = s->i_visible_height;
+    if (sys->params.chroma != TS_CHROMA_444) { x &= ~1; w &= ~1; }
+    if (sys->params.chroma == TS_CHROMA_420) { y &= ~1; h &= ~1; }
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+
+    const double sar = (s->i_sar_num > 0 && s->i_sar_den > 0) ? (double)s->i_sar_num / s->i_sar_den : 1.0;
+    const double dar = (double)w / h * sar;
+
+    int target;
+    if (sys->opt_height > 0) {
+        target = sys->opt_height;
+    } else if (sys->opt_height == 0) {
+        target = GetSystemMetrics(SM_CYSCREEN);
+    } else {
+        RECT rc;
+        GetClientRect(sys->hwnd, &rc);
+        const double ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+        if (ww < 16 || wh < 16) {                       /* fenêtre réduite : on garde la taille actuelle */
+            target = sys->out_h > 0 ? sys->out_h : 1080;
+        } else {
+            double disp_h = (ww / wh > dar) ? wh : ww / dar;     /* hauteur de l'image ajustée à la fenêtre */
+            if (sys->zoom_den > 0 && sys->zoom_num > 0) disp_h = disp_h * sys->zoom_num / sys->zoom_den;
+            target = (int)(disp_h + 0.5);
+        }
+    }
+
+    int min_h = h + 2;
+    const int min_h_for_w = (int)((w + 2) / dar) + 2;
+    if (min_h_for_w > min_h) min_h = min_h_for_w;
+    int out_h = target > min_h ? target : min_h;
+    const int cap = sys->max_tex > 0 ? sys->max_tex : 16384;
+    if (out_h > cap) out_h = cap;
+    out_h = (out_h + 1) & ~1;
+    int out_w = ((int)(out_h * dar + 0.5) + 1) & ~1;
+    if (out_w > cap) { out_w = cap & ~1; out_h = ((int)(out_w / dar + 0.5) + 1) & ~1; }
+
+    g->x = x; g->y = y; g->in_w = w; g->in_h = h;
+    g->out_w = out_w; g->out_h = out_h;
+    g->dar = dar;
+    if (sys->opt_ratio > 0) {                                   /* ratio fixe : pas de pulldown */
+        g->ratio = sys->opt_ratio; g->mult = sys->opt_ratio; g->target = 0;
+    } else {
+        AutoMult(sys, &g->ratio, &g->mult, &g->target);
+    }
+}
+
+static int GeomChangedEnough(const vout_display_sys_t *sys, const Geom *g)
+{
+    if (g->x != sys->x_off || g->y != sys->y_off || g->in_w != sys->params.in_w || g->in_h != sys->params.in_h)
+        return 1;                                        /* recadrage */
+    if (fabs(g->dar - sys->dar) > 0.002)
+        return 1;                                        /* rapport d'aspect */
+    if (g->ratio != sys->ratio)
+        return 1;                                        /* cadence / écran */
+    const int dh = abs(g->out_h - sys->out_h);
+    return dh * 100 > sys->out_h * 5;                    /* taille : au moins 5 % d'écart */
+}
+
+/* (Re)construit le scaler pour la géométrie g : vide la file de présentation, réalloue les
+ * tampons et rouvre le moteur (quelques centaines de ms). Renvoie 0 si OK. */
+static int Rebuild(vout_display_t *vd, vout_display_sys_t *sys, const Geom *g)
+{
+    /* 1) plus aucune image en cours de présentation */
+    EnterCriticalSection(&sys->cs);
+    for (int t = 0; t < 40 && sys->count > 0 && !sys->stop; t++)
+        SleepConditionVariableCS(&sys->cv, &sys->cs, 50);
+    LeaveCriticalSection(&sys->cs);
+
+    /* 2) ancien moteur et tampons */
+    if (sys->ts) { ts_close(sys->ts); sys->ts = NULL; }
+    for (int i = 0; i < NSLOT; i++) { free(sys->slot[i].data); sys->slot[i].data = NULL; }
+
+    /* 3) nouveaux paramètres */
+    sys->params.in_w = g->in_w;
+    sys->params.in_h = g->in_h;
+    sys->params.out_w = g->out_w;
+    sys->params.out_h = g->out_h;
+    sys->x_off = g->x;
+    sys->y_off = g->y;
+    sys->out_w = g->out_w;
+    sys->out_h = g->out_h;
+    sys->dar   = g->dar;
+    sys->ratio = sys->params.ratio = g->ratio;
+    sys->frame_bytes = (size_t)g->out_w * g->out_h * 3;
+    for (int i = 0; i < NSLOT; i++) {
+        sys->slot[i].data = malloc(sys->frame_bytes * (size_t)sys->ratio);
+        if (!sys->slot[i].data) return -1;
+    }
+
+    char err[256] = "";
+    sys->ts = ts_open(&sys->params, err, sizeof(err));
+    if (!sys->ts) {
+        msg_Err(vd, "temporal scaling failed to start: %s", err);
+        return -1;
+    }
+    msg_Info(vd, "%dx%d (crop %d,%d) -> %dx%d (DAR %.4f), mode %d, x%d frames computed (%.2f fps in, target %.2f Hz, x%.3f shown on average%s) on %s",
+             g->in_w, g->in_h, g->x, g->y, g->out_w, g->out_h, g->dar,
+             sys->params.mode, sys->ratio, sys->period > 0 ? (double)CLOCK_FREQ / sys->period : 0.0,
+             g->target, g->mult, sys->opt_ratio > 0 ? ", fixed ratio" : ", pulldown", ts_device_name());
+    return 0;
+}
+
 /* ---- sortie vidéo ---- */
 
 static void Prepare(vout_display_t *vd, picture_t *pic, subpicture_t *subpic)
 {
     vout_display_sys_t *sys = vd->sys;
     (void)subpic;
+    sys->frames_valid = 0;
+    if (sys->ts_failed) return;
 
-    if (!sys->ts) {
-        if (sys->ts_failed) return;
-        char err[256] = "";
-        sys->ts = ts_open(&sys->params, err, sizeof(err));
-        if (!sys->ts) {
-            msg_Err(vd, "temporal scaling failed to start: %s", err);
-            sys->ts_failed = 1;
-            sys->frames_valid = 0;
-            return;
-        }
-        msg_Info(vd, "%dx%d -> %dx%d, mode %d, x%d frames on %s", sys->params.in_w, sys->params.in_h,
-                 sys->params.out_w, sys->params.out_h, sys->params.mode, sys->ratio, ts_device_name());
-    }
-
-    /* durée d'une image : fréquence de la source si connue, sinon écart des dates */
-    if (vd->source.i_frame_rate > 0 && vd->source.i_frame_rate_base > 0)
+    /* durée d'une image : fréquence de la source au départ, puis écart réel des dates (lissé) ;
+     * nécessaire avec un désentrelacement VLC à double cadence (yadif2x, bob...) : la cadence
+     * annoncée par la source (25 i/s) n'est alors plus celle des images reçues (50 i/s) */
+    if (!sys->period_set && vd->source.i_frame_rate > 0 && vd->source.i_frame_rate_base > 0)
         sys->period = (mtime_t)CLOCK_FREQ * vd->source.i_frame_rate_base / vd->source.i_frame_rate;
-    else if (sys->last_date > 0 && pic->date > sys->last_date) {
-        mtime_t d = pic->date - sys->last_date;
-        if (d > 5000 && d < 200000) sys->period = d;
+    if (sys->last_date > 0 && pic->date > sys->last_date) {
+        const mtime_t d = pic->date - sys->last_date;
+        if (d > 5000 && d < 200000) {
+            if (!sys->period_set) {
+                sys->period = d; sys->period_set = 1;
+            } else if (d * 4 >= sys->period * 3 && d * 3 <= sys->period * 4) {
+                sys->period = (sys->period * 7 + d) / 8;        /* même cadence : lissage */
+                sys->period_chg = 0;
+            } else if (++sys->period_chg >= 3) {                /* cadence changée : 3 écarts de suite */
+                sys->period = d; sys->period_chg = 0;
+            }
+        }
     }
     sys->last_date = pic->date;
+
+    /* géométrie voulue (recadrage / aspect / taille de la fenêtre / multiplicateur de cadence selon
+     * l'écran) ; le moteur n'est reconstruit qu'une fois la demande stable depuis 400 ms (pas
+     * pendant un redimensionnement à la souris) */
+    Geom g;
+    ComputeGeom(vd, sys, &g);
+    if (!sys->ts) {
+        if (Rebuild(vd, sys, &g) != 0) { sys->ts_failed = 1; return; }
+    } else if (GeomChangedEnough(sys, &g)) {
+        const mtime_t now = mdate();
+        if (!sys->pending || g.out_h != sys->pend_h || g.x != sys->pend_x || g.y != sys->pend_y ||
+            g.in_w != sys->pend_w || g.in_h != sys->pend_hh || fabs(g.dar - sys->pend_dar) > 0.002 ||
+            g.ratio != sys->pend_ratio) {
+            sys->pending = 1;
+            sys->pend_ratio = g.ratio;
+            sys->pend_since = now;
+            sys->pend_h = g.out_h; sys->pend_x = g.x; sys->pend_y = g.y;
+            sys->pend_w = g.in_w;  sys->pend_hh = g.in_h; sys->pend_dar = g.dar;
+        } else if (now - sys->pend_since >= 400000) {
+            sys->pending = 0;
+            if (Rebuild(vd, sys, &g) != 0) { sys->ts_failed = 1; return; }
+        }
+    } else {
+        sys->pending = 0;
+    }
+
+    /* pulldown : nombre d'images à afficher pour cette image (moyenne g.mult, au plus R) */
+    {
+        double m = g.mult > sys->ratio ? sys->ratio : g.mult;
+        int base = (int)floor(m + 1e-9);
+        if (base < 1) base = 1;
+        int n = base;
+        const double fr = m - base;
+        if (fr > 1e-4) {
+            sys->acc += fr;
+            if (sys->acc >= 1.0 - 1e-9) { n = base + 1; sys->acc -= 1.0; }
+        } else {
+            sys->acc = 0;
+        }
+        sys->n_cur = n > sys->ratio ? sys->ratio : n;
+        sys->target_fps = g.target;
+    }
 
     const uint8_t *pl[3];
     int pt[3];
@@ -460,12 +710,10 @@ static void Prepare(vout_display_t *vd, picture_t *pic, subpicture_t *subpic)
     int u = sys->swap_uv ? 2 : 1, v = sys->swap_uv ? 1 : 2;
     pl[1] = pic->p[u].p_pixels;  pt[1] = pic->p[u].i_pitch;
     pl[2] = pic->p[v].p_pixels;  pt[2] = pic->p[v].i_pitch;
-    /* recadrage des plans de chrominance */
+    /* recadrage des plans de chrominance (4:2:0 : moitié, 4:2:2 : moitié en x, 4:4:4 : rien) */
     if (sys->x_off || sys->y_off) {
-        const int cx = (pic->p[1].i_visible_pitch && pic->p[0].i_visible_pitch)
-                       ? sys->x_off * pic->p[1].i_visible_pitch / pic->p[0].i_visible_pitch : sys->x_off / 2;
-        const int cy = (pic->p[1].i_visible_lines && pic->p[0].i_visible_lines)
-                       ? sys->y_off * pic->p[1].i_visible_lines / pic->p[0].i_visible_lines : sys->y_off / 2;
+        const int cx = (sys->params.chroma == TS_CHROMA_444) ? sys->x_off : sys->x_off / 2;
+        const int cy = (sys->params.chroma == TS_CHROMA_420) ? sys->y_off / 2 : sys->y_off;
         pl[1] += (size_t)cy * pt[1] + cx;
         pl[2] += (size_t)cy * pt[2] + cx;
     }
@@ -486,9 +734,16 @@ static void Display(vout_display_t *vd, picture_t *pic, subpicture_t *subpic)
 
     /* on confie les images au thread de rendu et on rend la main tout de suite */
     EnterCriticalSection(&sys->cs);
-    if (!sys->stop && sys->count < NSLOT) {
+    if (!sys->stop && sys->count < NSLOT && sys->ts) {
         sys->slot[sys->wr].date = pic->date;
-        sys->slot[sys->wr].n    = sys->frames_valid ? sys->ratio : 0;
+        sys->slot[sys->wr].n    = sys->frames_valid ? sys->n_cur : 0;
+        sys->slot[sys->wr].R    = sys->ratio;
+        /* écart entre deux images affichées : une période d'écran en mode automatique (la synchro
+         * verticale fait le reste), sinon la durée de l'image répartie sur les n images */
+        sys->slot[sys->wr].step = sys->target_fps > 0 ? (mtime_t)(CLOCK_FREQ / sys->target_fps)
+                                : sys->period / (sys->n_cur > 0 ? sys->n_cur : 1);
+        sys->slot[sys->wr].w    = sys->out_w;
+        sys->slot[sys->wr].h    = sys->out_h;
         sys->wr = (sys->wr + 1) % NSLOT;
         sys->count++;
         WakeAllConditionVariable(&sys->cv);
@@ -509,15 +764,19 @@ static int Control(vout_display_t *vd, int query, va_list args)
         OwnFullscreen(sys, cfg->is_fullscreen);
         return VLC_SUCCESS;
     }
-    case VOUT_DISPLAY_CHANGE_WINDOW_STATE:
+    case VOUT_DISPLAY_CHANGE_ZOOM: {
+        const vout_display_cfg_t *cfg = va_arg(args, const vout_display_cfg_t *);
+        sys->zoom_num = cfg->zoom.num;
+        sys->zoom_den = cfg->zoom.den;
         return VLC_SUCCESS;
-    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:
+    }
+    case VOUT_DISPLAY_CHANGE_WINDOW_STATE:
+    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:      /* la fenêtre et la géométrie sont relues à chaque image */
     case VOUT_DISPLAY_CHANGE_DISPLAY_FILLED:
-    case VOUT_DISPLAY_CHANGE_ZOOM:
-    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:
+    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:     /* vd->source est déjà mis à jour par VLC */
     case VOUT_DISPLAY_CHANGE_SOURCE_CROP:
     case VOUT_DISPLAY_CHANGE_VIEWPOINT:
-        return VLC_SUCCESS;     /* la fenêtre est relue à chaque image */
+        return VLC_SUCCESS;
     default:
         return VLC_EGENERIC;
     }
@@ -530,72 +789,52 @@ static int Open(vlc_object_t *obj)
     vout_display_sys_t *sys = calloc(1, sizeof(*sys));
     if (!sys) return VLC_ENOMEM;
     vd->sys = sys;
-
     sys->vd = vd;
 
     /* ---- format d'entrée : YUV planaire 8 bits, sinon VLC convertit en I420 ---- */
     video_format_t fmt = vd->fmt;
-    TsParams p;
-    memset(&p, 0, sizeof(p));
+    TsParams *p = &sys->params;
     switch (fmt.i_chroma) {
-        case VLC_CODEC_I420: p.chroma = TS_CHROMA_420; break;
-        case VLC_CODEC_J420: p.chroma = TS_CHROMA_420; p.yuv_full = 1; break;
-        case VLC_CODEC_YV12: p.chroma = TS_CHROMA_420; sys->swap_uv = 1; break;
-        case VLC_CODEC_I422: p.chroma = TS_CHROMA_422; break;
-        case VLC_CODEC_J422: p.chroma = TS_CHROMA_422; p.yuv_full = 1; break;
-        case VLC_CODEC_I444: p.chroma = TS_CHROMA_444; break;
-        case VLC_CODEC_J444: p.chroma = TS_CHROMA_444; p.yuv_full = 1; break;
+        case VLC_CODEC_I420: p->chroma = TS_CHROMA_420; break;
+        case VLC_CODEC_J420: p->chroma = TS_CHROMA_420; p->yuv_full = 1; break;
+        case VLC_CODEC_YV12: p->chroma = TS_CHROMA_420; sys->swap_uv = 1; break;
+        case VLC_CODEC_I422: p->chroma = TS_CHROMA_422; break;
+        case VLC_CODEC_J422: p->chroma = TS_CHROMA_422; p->yuv_full = 1; break;
+        case VLC_CODEC_I444: p->chroma = TS_CHROMA_444; break;
+        case VLC_CODEC_J444: p->chroma = TS_CHROMA_444; p->yuv_full = 1; break;
+        case VLC_CODEC_D3D9_OPAQUE: case VLC_CODEC_D3D9_OPAQUE_10B:
+        case VLC_CODEC_D3D11_OPAQUE: case VLC_CODEC_D3D11_OPAQUE_10B:
+            /* surfaces du décodage matériel : le désentrelacement de VLC ne peut pas s'y appliquer
+             * (VLC retire alors tout le filtre -> image en peigne). On refuse : le décodeur
+             * retombe sur le décodage logiciel, où le désentrelacement et les sous-titres marchent. */
+            free(sys);
+            vd->sys = NULL;
+            return VLC_EGENERIC;
         default:
             fmt.i_chroma = VLC_CODEC_I420;
-            p.chroma = TS_CHROMA_420;
+            p->chroma = TS_CHROMA_420;
             break;
     }
-    if (fmt.b_color_range_full) p.yuv_full = 1;
-    p.in_w = fmt.i_visible_width;
-    p.in_h = fmt.i_visible_height;
-    sys->x_off = fmt.i_x_offset;
-    sys->y_off = fmt.i_y_offset;
-    if (p.chroma != TS_CHROMA_444) { p.in_w &= ~1; sys->x_off &= ~1; }
-    if (p.chroma == TS_CHROMA_420) { p.in_h &= ~1; sys->y_off &= ~1; }
-
-    p.yuv_709 = (fmt.space == COLOR_SPACE_BT709 || fmt.space == COLOR_SPACE_BT2020)
-                ? 1 : (fmt.space == COLOR_SPACE_UNDEF && p.in_h >= 720);
+    if (fmt.b_color_range_full) p->yuv_full = 1;
+    p->yuv_709 = (fmt.space == COLOR_SPACE_BT709 || fmt.space == COLOR_SPACE_BT2020)
+                 ? 1 : (fmt.space == COLOR_SPACE_UNDEF && (int)fmt.i_visible_height >= 720);
 
     /* ---- options ---- */
-    p.mode           = var_InheritInteger(vd, "tscale-mode");
-    sys->ratio       = p.ratio = var_InheritInteger(vd, "tscale-ratio");
-    p.tmp_mode       = var_InheritInteger(vd, "tscale-tmp-mode");
-    p.curve_base     = var_InheritFloat(vd, "tscale-curve");
-    p.kaiser_beta    = var_InheritFloat(vd, "tscale-beta");
-    p.aniso_strength = var_InheritFloat(vd, "tscale-aniso");
-    p.ocl_device     = var_InheritInteger(vd, "tscale-device");
-    int out_h        = var_InheritInteger(vd, "tscale-height");
-    if (out_h <= 0) out_h = GetSystemMetrics(SM_CYSCREEN);
+    p->mode           = var_InheritInteger(vd, "tscale-mode");
+    sys->opt_fps      = var_InheritFloat(vd, "tscale-fps");
+    sys->opt_ratio    = var_InheritInteger(vd, "tscale-ratio");     /* 0 = automatique (écran) */
+    sys->ratio        = p->ratio = sys->opt_ratio > 0 ? sys->opt_ratio : 1;
+    p->tmp_mode       = var_InheritInteger(vd, "tscale-tmp-mode");
+    p->curve_base     = var_InheritFloat(vd, "tscale-curve");
+    p->kaiser_beta    = var_InheritFloat(vd, "tscale-beta");
+    p->aniso_strength = var_InheritFloat(vd, "tscale-aniso");
+    p->ocl_device     = var_InheritInteger(vd, "tscale-device");
+    sys->opt_height   = var_InheritInteger(vd, "tscale-height");
+    sys->zoom_num     = vd->cfg->zoom.num;
+    sys->zoom_den     = vd->cfg->zoom.den;
+    sys->period       = CLOCK_FREQ / 25;
+    sys->max_tex      = 16384;
 
-    /* largeur : on garde le rapport d'aspect d'affichage (DAR) de la source */
-    double sar = (vd->source.i_sar_num > 0 && vd->source.i_sar_den > 0)
-                 ? (double)vd->source.i_sar_num / vd->source.i_sar_den : 1.0;
-    double dar = (double)p.in_w / p.in_h * sar;
-    p.out_h = (out_h + 1) & ~1;
-    p.out_w = ((int)(p.out_h * dar + 0.5) + 1) & ~1;
-    sys->out_w = p.out_w;
-    sys->out_h = p.out_h;
-    sys->period = CLOCK_FREQ / 25;
-
-    /* vérifications bon marché tout de suite ; l'initialisation lourde d'OpenCL
-     * (compilation des noyaux, tables) est faite à la première image : VLC ouvre et
-     * referme parfois la sortie plusieurs fois au démarrage (essais de décodage matériel). */
-    char err[256] = "";
-    if (ts_check(&p, err, sizeof(err)) != 0) {
-        msg_Err(vd, "temporal scaling unavailable: %s", err);
-        goto error;
-    }
-    sys->params = p;
-    sys->frame_bytes = (size_t)p.out_w * p.out_h * 3;
-    for (int i = 0; i < NSLOT; i++) {
-        sys->slot[i].data = malloc(sys->frame_bytes * (size_t)sys->ratio);
-        if (!sys->slot[i].data) goto error;
-    }
     InitializeCriticalSection(&sys->cs);
     InitializeConditionVariable(&sys->cv);
     sys->gl_event = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -607,19 +846,39 @@ static int Open(vlc_object_t *obj)
     } else {
         if (sys->window) { vout_display_DeleteWindow(vd, sys->window); sys->window = NULL; }
         sys->own_window = 1;
+        sys->out_w = fmt.i_visible_width * 2;       /* taille initiale de la fenêtre propre */
+        sys->out_h = fmt.i_visible_height * 2;
         if (OwnWindowOpen(sys) != 0) { msg_Err(vd, "cannot create the video window"); goto error; }
+        sys->out_w = sys->out_h = 0;
     }
+
+    /* vérifications bon marché tout de suite ; l'initialisation lourde d'OpenCL (noyaux, tables) est
+     * faite à la première image : VLC ouvre et referme parfois la sortie plusieurs fois au démarrage
+     * (essais de décodage matériel) */
+    {
+        Geom g;
+        ComputeGeom(vd, sys, &g);
+        TsParams chk = *p;
+        chk.in_w = g.in_w; chk.in_h = g.in_h; chk.out_w = g.out_w; chk.out_h = g.out_h;
+        chk.ratio = g.ratio;
+        char err[256] = "";
+        if (ts_check(&chk, err, sizeof(err)) != 0) {
+            msg_Err(vd, "temporal scaling unavailable: %s", err);
+            goto error;
+        }
+        msg_Info(vd, "tscale ready: %dx%d -> %dx%d (DAR %.4f), mode %d, x%d frames, height %s",
+                 g.in_w, g.in_h, g.out_w, g.out_h, g.dar, p->mode, g.ratio,
+                 sys->opt_height < 0 ? "automatic" : sys->opt_height == 0 ? "= screen" : "fixed");
+    }
+
     if (GlOpen(vd, sys) != 0) goto error;
     sys->render = CreateThread(NULL, 0, RenderThread, sys, 0, NULL);
     if (!sys->render) goto error;
     WaitForSingleObject(sys->gl_event, 10000);
     if (sys->gl_failed) {
-        msg_Err(vd, "OpenGL initialisation failed (%d): texture %dx%d", sys->gl_failed, sys->out_w, sys->out_h);
+        msg_Err(vd, "OpenGL initialisation failed (%d)", sys->gl_failed);
         goto error;
     }
-
-    msg_Info(vd, "tscale ready: %dx%d -> %dx%d (DAR %.4f), mode %d, x%d frames (GPU starts on the first picture)",
-             p.in_w, p.in_h, p.out_w, p.out_h, dar, p.mode, p.ratio);
 
     vd->fmt     = fmt;
     vd->pool    = Pool;

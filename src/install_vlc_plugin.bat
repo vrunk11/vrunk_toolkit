@@ -1,23 +1,46 @@
 @echo off
-REM Installe le plugin VLC "tscale" dans le dossier plugins de VLC (necessite les droits admin :
-REM clic droit > Executer en tant qu'administrateur). Apres cela, la sortie video "Temporal scaling
-REM (OpenCL GPU)" est disponible dans VLC : Outils > Preferences > Video > Sortie, et ses reglages
-REM dans Preferences > Tout > Video > Sortie > tscale. Lancer VLC une fois avec --reset-plugins-cache
-REM si VLC ne la voit pas. Pour desinstaller : supprimer le fichier copie.
+REM Installe le plugin VLC "tscale" dans le dossier plugins de VLC. La copie dans
+REM "Program Files" demande les droits administrateur : si le script n'est pas lance en
+REM administrateur, il se relance tout seul (une fenetre de confirmation Windows s'affiche).
+REM
+REM Ensuite : VLC > Outils > Preferences > Video > Sortie > "Temporal scaling (OpenCL GPU)"
+REM (ses reglages : Preferences > Tout > Video > Sortie > tscale). Pour desinstaller :
+REM supprimer le fichier copie.
 setlocal
 cd /d "%~dp0"
 set "SRC=%~dp0vlc_plugin\video_output\libtscale_plugin.dll"
-set "DST=C:\Program Files\VideoLAN\VLC\plugins\video_output"
+set "VLCDIR=C:\Program Files\VideoLAN\VLC"
+set "DST=%VLCDIR%\plugins\video_output"
 
-if not exist "%SRC%" ( echo Plugin absent : lance d'abord build_vlc_plugin.bat & exit /b 1 )
-if not exist "%DST%" ( echo Dossier VLC introuvable : %DST% & exit /b 1 )
-
-copy /y "%SRC%" "%DST%\" >nul
+net session >nul 2>&1
 if errorlevel 1 (
-    echo ECHEC de la copie : relance ce script en administrateur.
+    echo Droits administrateur requis : relance du script en administrateur...
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b 0
+)
+
+if not exist "%SRC%" ( echo Plugin absent : lance d'abord build_vlc_plugin.bat & pause & exit /b 1 )
+if not exist "%DST%" ( echo Dossier VLC introuvable : %DST% & pause & exit /b 1 )
+
+REM VLC doit etre ferme : il verrouille ses plugins pendant qu'il tourne
+tasklist /fi "imagename eq vlc.exe" | find /i "vlc.exe" >nul
+if not errorlevel 1 (
+    echo Ferme VLC avant l'installation, puis relance ce script.
+    pause
     exit /b 1
 )
-"C:\Program Files\VideoLAN\VLC\vlc-cache-gen.exe" "C:\Program Files\VideoLAN\VLC\plugins" >nul 2>nul
+
+copy /y "%SRC%" "%DST%\"
+if errorlevel 1 (
+    echo ECHEC de la copie vers %DST%
+    pause
+    exit /b 1
+)
+
+REM regenere le cache des plugins de VLC pour qu'il voie le nouveau module
+"%VLCDIR%\vlc-cache-gen.exe" "%VLCDIR%\plugins"
+echo.
 echo OK : plugin installe dans %DST%
+echo Lance VLC, puis Outils ^> Preferences ^> Video ^> Sortie ^> "Temporal scaling (OpenCL GPU)".
 endlocal
 pause

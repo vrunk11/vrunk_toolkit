@@ -1283,16 +1283,16 @@ static void ocl_release(void)
 	REL(g_ocl.d_dense[0]); REL(g_ocl.d_dense[1]);
 	REL(g_ocl.d_krad);
 	#undef REL
-	if(g_ocl.k_blend) a->ReleaseKernel(g_ocl.k_blend);
-	if(g_ocl.k_grad)  a->ReleaseKernel(g_ocl.k_grad);
-	if(g_ocl.k_conf)  a->ReleaseKernel(g_ocl.k_conf);
-	if(g_ocl.k_dist)  a->ReleaseKernel(g_ocl.k_dist);
-	if(g_ocl.k_scale) a->ReleaseKernel(g_ocl.k_scale);
-	if(g_ocl.k_scale4) a->ReleaseKernel(g_ocl.k_scale4);
-	if(g_ocl.k_yuv) a->ReleaseKernel(g_ocl.k_yuv);
-	if(g_ocl.prog)    a->ReleaseProgram(g_ocl.prog);
-	if(g_ocl.q)       a->ReleaseCommandQueue(g_ocl.q);
-	if(g_ocl.ctx)     a->ReleaseContext(g_ocl.ctx);
+	#define RELK(k) do { if(k) { a->ReleaseKernel(k); (k) = NULL; } } while(0)
+	RELK(g_ocl.k_blend); RELK(g_ocl.k_grad); RELK(g_ocl.k_conf); RELK(g_ocl.k_dist);
+	RELK(g_ocl.k_scale); RELK(g_ocl.k_scale4); RELK(g_ocl.k_yuv);
+	#undef RELK
+	if(g_ocl.prog) { a->ReleaseProgram(g_ocl.prog);      g_ocl.prog = NULL; }
+	if(g_ocl.q)    { a->ReleaseCommandQueue(g_ocl.q);    g_ocl.q    = NULL; }
+	if(g_ocl.ctx)  { a->ReleaseContext(g_ocl.ctx);       g_ocl.ctx  = NULL; }
+	// état réinitialisable : un nouvel ocl_init/ocl_setup peut suivre (changement de taille)
+	g_ocl.next_valid = 0;
+	g_ocl.last_next  = NULL;
 	g_ocl.ready = 0;
 }
 

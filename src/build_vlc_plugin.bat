@@ -65,3 +65,4 @@ if errorlevel 1 ( echo ECHEC edition de liens & exit /b 1 )
 
 echo OK : %ROOT%\video_output\libtscale_plugin.dll
 endlocal
+pause
